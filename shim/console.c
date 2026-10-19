@@ -1,25 +1,26 @@
 /*
- * Minimal text console on the ABL splash framebuffer. With the MMU off
+ * Minimal text console on the bootloader's scanout framebuffer. With the MMU off
  * every access is Device memory, so stay aligned (-mstrict-align).
  */
 #include "console.h"
 #include "font.h"
 
-#define SCALE		3
+#define SCALE		2
 #define CH_W		(8 * SCALE)
 #define CH_H		(16 * SCALE)
 #define MARGIN		24
 #define LABEL_COLS	8
 
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
+int con_w = FB_W, con_h = FB_H, con_stride = FB_STRIDE;
 static uint32_t con_bg;
 static int row;
 
 void con_clear(uint32_t bg)
 {
-	for (int y = 0; y < FB_H; y++) {
-		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
-		for (int x = 0; x < FB_W; x++)
+	for (int y = 0; y < con_h; y++) {
+		volatile uint32_t *line = con_fb + y * (con_stride / 4);
+		for (int x = 0; x < con_w; x++)
 			line[x] = bg;
 	}
 	con_bg = bg;
@@ -32,13 +33,13 @@ static void put_char(int col, char ch, uint32_t fg)
 		ch = '?';
 	const unsigned char *g = font8x16[ch - 0x20];
 	int x0 = MARGIN + col * CH_W, y0 = MARGIN + row * CH_H;
-	if (x0 + CH_W > FB_W || y0 + CH_H > FB_H)
+	if (x0 + CH_W > con_w || y0 + CH_H > con_h)
 		return;
 	for (int gy = 0; gy < 16; gy++)
 		for (int gx = 0; gx < 8; gx++) {
 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
 			for (int sy = 0; sy < SCALE; sy++) {
-				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
+				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (con_stride / 4)
 						       + x0 + gx * SCALE;
 				for (int sx = 0; sx < SCALE; sx++)
 					p[sx] = c;
@@ -64,6 +65,21 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 void con_skip(void)
 {
 	row++;
+}
+
+void con_bg_set(uint32_t bg)
+{
+	con_bg = bg;
+}
+
+int con_row(void)
+{
+	return row;
+}
+
+void con_set_row(int r)
+{
+	row = r;
 }
 
 void con_str(const char *label, const char *s)

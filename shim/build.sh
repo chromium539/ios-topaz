@@ -1,41 +1,46 @@
 #!/bin/bash
-# Build the shim and wrap it in a boot.img v4: the topaz (Xiaomi) ABL ignores
-# v1/v2 images. The DTB and the vendor ramdisk come from vendor_boot of the
-# active slot; loader.c finds our payload behind the vendor ramdisk.
+# Build the shim and wrap it the way Huawei Kirin fastboot wants a kernel:
+# Android boot image v1, gzip'd arm64 Image at base+0x80000, no ramdisk
+# (same header values as ../marie/clean/kernel_boot.img). Huawei fastboot
+# refuses `fastboot boot`, so the result is flashed to the kernel partition.
 set -euo pipefail
 cd "$(dirname "$0")"
-CC=aarch64-linux-gnu-gcc
-OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+CC="clang --target=aarch64-none-elf"
+OBJCOPY=llvm-objcopy
+CFLAGS="-O2 -mcpu=cortex-a53 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-jump-tables -Wall -Wextra"
+OBJS="start shim console"
 mkdir -p out
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
-	$CC $CFLAGS -c $f -o out/${f%.*}.o
+for f in $OBJS; do
+	src=$f.c
+	[ -f $src ] || src=$f.S
+	$CC $CFLAGS -c $src -o out/$f.o
 done
-# The image runs wherever ABL puts it with no relocation pass: only the
+# The image runs wherever fastboot puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$(aarch64-linux-gnu-readelf -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
+abs=$(for f in $OBJS; do [ $f = start ] || llvm-readelf -r out/$f.o; done | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
-$CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
+$CC $CFLAGS -static -fuse-ld=lld -T shim.ld -Wl,--build-id=none -Wl,-N \
+	$(for f in $OBJS; do echo out/$f.o; done) -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
-# ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
-size=$((16#$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}')))
+# Pad to image_size so .bss/stacks exist as zeroed bytes.
+size=$((16#$(llvm-nm out/shim.elf | awk '$3=="_end"{print $1}')))
 truncate -s "$size" out/Image
-# Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
-# newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
+# Optional xnu payload (tools/mkpayload.py) as $1: append it to the Image at
+# the first 4K boundary after _end and grow image_size (loader.c finds it).
 if [ -n "${1:-}" ]; then
-	# topaz ABL drops the v4 boot ramdisk: append the payload to the Image at
-	# the first 4K boundary after _end (loader.c) and grow image_size.
 	truncate -s $(( (size + 0xfff) & ~0xfff )) out/Image
 	cat "$1" >> out/Image
 	python3 -c 'import os,struct,sys; f=open(sys.argv[1],"r+b"); f.seek(16); f.write(struct.pack("<Q", os.path.getsize(sys.argv[1])))' out/Image
-	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
-else
-	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-${MKBOOTIMG:-python3 /home/makr/work/topaz/mkbootimg_src/mkbootimg.py} --header_version 4 --kernel out/Image --ramdisk out/ramdisk.bin \
-	--os_version 13.0.0 --os_patch_level 2025-01 \
-	--cmdline "console=null" -o out/shim-boot.img
+gzip -9 -n -c out/Image > out/Image.gz
+mkbootimg --header_version 1 --kernel out/Image.gz \
+	--base 0 --kernel_offset 0x80000 --ramdisk_offset 0x07c00000 \
+	--tags_offset 0x07a00000 --pagesize 2048 \
+	--os_version 9.0.0 --os_patch_level 2019-04 \
+	--cmdline "console=null" -o out/shim-kernel.img
+# mkbootimg zeroes ramdisk/second addresses without a ramdisk; the stock
+# image keeps them (the header id hash does not cover addresses).
+python3 -c 'import struct,sys; f=open(sys.argv[1],"r+b"); f.seek(20); f.write(struct.pack("<I",0x07c00000)); f.seek(28); f.write(struct.pack("<I",0x00f00000))' out/shim-kernel.img
 # Host render of the console layout.
-gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
-ls -l out/Image out/shim-boot.img
+cc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
+ls -l out/Image out/shim-kernel.img

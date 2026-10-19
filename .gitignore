@@ -8,3 +8,10 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# phone-screen photos
+*.jpg
+*.JPG
+*.jpeg
+*.png
+*.heic
+*.HEIC

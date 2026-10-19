@@ -1,0 +1,117 @@
+# iOS 16 on the Huawei P30 Lite (marie) with 64-bit XNU
+
+## Context
+The 32-bit Galaxy J1 port (kOtusin/uniloader + xnu-j1xlte) is ruled out. The P30 Lite's bootloader starts the kernel at EL1 (`CPU: All CPU(s) started at EL1`), so a 32-bit kernel can't run. The 64-bit route has a working precedent with nearly the same CPU:
+
+- **[dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)**: Apple's open-source **xnu-8796**, booted on a Redmi Note 10 Pro (SM7150), running the **unmodified iPhone X iOS 16.7.x userland** up to SpringBoard.
+- **[MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz)**: a port of sweet to the Redmi Note 12 4G (SM6225: 4×A53-class + 4×A73-class, **ARMv8.0**). It reaches the iOS lock screen. It has already solved the ARMv8.0 problems we would hit:
+  - building with `-mcpu=cortex-a53`
+  - no PAN
+  - emulating userland LSE atomics and `ldapr` (patch 0081)
+  - booting XNU on the A73 cores because the A53 cores have no 16K translation granule (shim PSCI `CPU_ON` + patch 0082)
+
+The marie port therefore **forks ios-topaz** and replaces the Qualcomm-specific parts with Kirin 710 ones. The two SoCs differ mainly in the interrupt controller (GIC-400/GICv2 instead of GICv3), the storage (eMMC/SDHCI instead of UFS), the display, and the touch/SPI hardware.
+
+## Marie hardware facts (read from the running LineageOS 20 over adb on 2026-10-19)
+| Item | Value | Notes vs topaz |
+| --- | --- | --- |
+| CPUs | cpu@0–3 Cortex-A53 (`0xd03`, MIDR `410fd034`), cpu@100–103 Cortex-A73 (`0xd09`) | Same split as topaz. **Boots on A53 CPU 0** → hand off to `0x100` |
+| PSCI | `cpu_on`/`cpu_off`/`system_reset`/`system_off` present | Same mechanism topaz uses |
+| GIC | GIC-400, **GICD `0xE82B1000`, GICC `0xE82B2000`** | **GICv2, memory-mapped CPU interface**; topaz uses GICv3 system registers |
+| Timer | `arm,armv8-timer`, PPIs secure 13 / NS-phys 14 / virt 11 / hyp 10 (INTID +16 → **vtimer 27**), **CNTFRQ 1.92 MHz** (`0x1d4c00`) | topaz: vtimer INTID 19 at 19.2 MHz |
+| RAM | 4 GB model. Usable: `0x2E200000–0xDFFFFFFF` (~2.8 GiB contiguous), `0x2_00000000–0x2_1FFFFFFF` | Carve-outs (bl31, secos, modem, hifi, bbox) all lie below `0x2E200000` |
+| Storage | eMMC `mmcblk0` (model `DA4128`), host **`sdhci@FF3E1000`** (`mshc,sdhci`, Linux `drivers/mmc/host/sdhci_mshc_libra.c`), `userdata` = `mmcblk0p70`, `kernel` = `mmcblk0p43` | topaz: UFS |
+| SD slot | `dwmmc1@FF37F000` (DesignWare) | optional later |
+| Display | 1080×2312, 32 bpp, stride 4320, panel `MARI_130 203` 6.15"; fastboot logo buffer `0x18C00000` (+`0x3000000`) | Scanout address still to be confirmed (Phase 0) |
+| Touch | Huawei `ts_kit` → **Novatek** over **SPI (PL022)**, 10 MHz, mode 1, CS GPIO 10, 1080×2312 | topaz: FocalTech over I²C |
+| Watchdog | SP805 at `0xE8A06000`, 24 s (same as uniLoader's `board-agassi2.c`) | the shim must disable it |
+| Boot image | Android boot v1, kernel at `0x80000`, page `0x800`, flashed to `kernel` partition (see `../marie/clean/kernel_boot.img`) | topaz: boot v4 via `fastboot boot` |
+
+## Prerequisites
+- A GitHub account for the macOS runner build (`.github/workflows/xnu.yml`: macos-14, Xcode 15, blacktop/darwin-xnu-build, xnu-8796). No Mac is needed.
+- The iPhone X (iPhone10,3) iOS 16.7.x IPSW from Apple. `apfs-fuse`, `hfsprogs`, `img2simg`, `aarch64-linux-gnu-gcc`, AOSP `mkbootimg`.
+- **Accept that `userdata` gets wiped** when the iOS root is flashed there. Back up `kernel`, `userdata` and the GPT first. `../marie/clean/` already holds the stock `kernel_boot.img`, `dts.img`, `dto.img` and `vbmeta.img`.
+- Recovery path: Vol-Down + USB → fastboot → `fastboot flash kernel clean/kernel_boot.img`. This is already proven by the ~30 marie test images.
+
+## Phase 0 results (2026-10-19, `shim/` on branch `marie`, photos IMG_1907/1908)
+All gates passed:
+- **`fastboot boot` is refused** (`Command not allowed`), so each test means flashing the `kernel` partition. The boot v1 header must match stock (`shim/build.sh`). Fastboot jumps to the gzip'd Image at `0x80000`, EL1, DTB in x0 = `0x7A00000`.
+- **Display:**
+  - fastboot leaves DSS read channel **D2** (`DSS_BASE+0x50000`) scanning out **`0x18C00000`**, stride 4320 B, OVL0 1080×2312, rdma ctrl `0x28` (no SMMU); CPU writes show up directly
+  - idle read channels (VG0, VG2, G0) **abort on read**, so register probes must survive external aborts (`probe32()`)
+- **CPUs:**
+  - A53 CPU0: MIDR `410FD034`, TGran16 = 0
+  - A73 at 0x100: MIDR `410FD092`, **TGran16 = 1**, reached with PSCI `CPU_ON` (PSCI 1.0, SMCCC 1.1)
+  - neither core has LSE (`isar0 = 0x11120`)
+- **GIC-400:** GICD_TYPER `0xFCEB` (384 IRQs, 8 CPU interfaces, SecurityExtn). The CPU interface on A73 0x100 is **#4**. GICD/GICC are already enabled for Group 1 with PMR `0xF0`. vtimer PPI 27, ptimer PPI 30 and SGI 1 are delivered as NS Group 1 IRQs (30/30/10 in 300 ms).
+- **Watchdog:** after disabling the SP805, 300 s idle with no reset.
+
+## Phase 0: Bare-metal probes (shim only, no XNU)
+Fork ios-topaz into this directory and add a `marie` branch. Adapt `shim/` (`start.S`, `shim.c`, `loader.c`, `mmu.c`, `console.c`, `build.sh`):
+1. **Boot format:** keep a Linux arm64 Image header and pack it as **boot v1** with kernel at `0x80000`. Put the payload after `_end`, as topaz already does. First test whether Huawei fastboot accepts `fastboot boot` with the stock `clean/kernel_boot.img`. If it does, use RAM boots for every iteration; if not, flash to `kernel`.
+2. **Watchdog:** disable the SP805 at `0xE8A06000` first thing; the code can be lifted from `board-agassi2.c`. Then let the shim idle for 5 minutes with no Linux running, to rule out an LPM3/system watchdog.
+3. **Framebuffer:** paint test bars at `0x18C00000` (1080×2312×4). If nothing appears, read the DSS overlay/RDMA address registers (DSS base from the `dss`/`hisifb` DT node in `kernel-marie`) to find the real scanout buffer. Put the shim console there.
+4. **CPU checks:** print `CurrentEL`, MIDR, and `ID_AA64MMFR0_EL1` on CPU 0 and on CPU `0x100` after PSCI `CPU_ON`. **Gate: the A73 must report TGran16 ≠ 0.** If it doesn't, XNU needs a 4K-page build (topaz roadmap item 6), which is much riskier.
+5. **GIC:** on CPU `0x100`, read `GICD_TYPER`, `GICD_IGROUPRn`, `GICD_ITARGETSR0` (this CPU's interface bit) and `GICC_IIDR`. Fire a test SGI and a vtimer PPI 27 and confirm they arrive as Group 1 IRQs.
+6. **Toolchain:** run topaz's unmodified `xnu.yml` on the fork to confirm the CI build works.
+
+## Phase 1: `MARIE` machine config in XNU
+Base it on topaz's patch series. Keep 0001–0027 (toolchain, console, PE, mockfs, AMFI/HFS/bearssl), 0035–0059, 0064–0068 and 0081–0082. Drop or gate the Qualcomm drivers: UFS 0028/0030/0034/0069, Goodix/FT touch, MDP scanout 0092+, battery 0091, USB 0072–0077.
+
+New patches, starting at 0200:
+- **0200 machine config:** `SUPPORTED_ARM64_MACHINE_CONFIGS += MARIE`, `-mcpu=cortex-a53`, plain arm64 (no arm64e), and `pexpert/pexpert/arm64/MARIE.h` modelled on `SWEET.h`.
+- **0201 GICv2 backend.** This replaces the `ICC_*_EL1` sysreg code in `osfmk/arm64/sleh.c`, `pexpert/arm/pe_fiq.c` and `iokit/Kernel/arm/SweetCPU.cpp` (topaz patch 0004/0018):
+  - IRQ ack/EOI: `GICC_IAR` (+0x0C) / `GICC_EOIR` (+0x10)
+  - CPU interface setup: `GICC_PMR` (+0x04) = 0xF0, `GICC_CTLR` (+0x00) enable Group 1
+  - IPIs: `GICD_SGIR` (+0xF00), target list taken from each CPU's `GICD_ITARGETSR0` byte (not from MPIDR)
+  - SPI enable/priority/target: `GICD_ISENABLER`/`IPRIORITYR`/`ITARGETSR`
+  - map both register blocks through the ADT `reg` entries
+  - vtimer is INTID 27
+- **0202 timer/CPU topology:** 1.92 MHz timebase in the ADT. Boot on `0x100` (reuse 0082). List cluster 0x100–0x103 as P-cores only; the A53s stay parked.
+- **0203 framebuffer console** with the marie geometry from Phase 0, and the iPhone X display identity scaled to 1080×2312 (as topaz 0061 does for 1080×2400).
+- `tools/mkadt.py`:
+  - add a `--board marie` profile with the memory window. Start conservatively at `0x40000000` + 2 GiB, then grow to the full `0x2E200000–0xDFFFFFFF` range.
+  - add GIC, timer and SP805 nodes, the A73 CPU nodes, and the `/product` node copied from the iPhone X ADT (`d22ap`).
+- **Milestone:** XNU verbose boot text on the panel, with all 4 A73s up via sweet's PSCI SMP patch 0065. Boot it with the mockfs ramdisk root (0021/0022/0024) and a tiny `launchd` test (`tools/mkinit.py`) before any storage work.
+
+## Phase 2: eMMC root
+- **0210 SDHCI eMMC driver** for `sdhci@FF3E1000`. It replaces UFS as the root device provider used by `rd=` (topaz 0028):
+  - start with PIO or SDMA, single and multi-block CMD17/18/24/25
+  - reuse the controller and card state fastboot leaves behind (clocks, bus width, HS200/HS400 timing) instead of reinitialising; keep a slow re-init fallback modelled on `sdhci_mshc_libra.c`
+  - the userdata start LBA comes from `/sys/block/mmcblk0/mmcblk0p70/start` and is passed as a boot-arg (`emmcroot=<lba>`), or the driver parses the GPT
+- Writes and journaling (topaz 0030/0031 equivalents), then a performance pass (ADMA2).
+- **Milestone:** `rd=emmcroot0 rootrw=1` mounts the HFS+ iOS root, and launchd plus the daemons start. Verify in the persistent log ring (0047) and with `tools/sweet-log.py`.
+
+## Phase 3: iOS userland to SpringBoard
+- Build the root exactly as topaz does: `tools/mkiosroot.sh` with the iPhone X 16.7.x OS/SystemOS/AppOS images, then `tools/sweet-root-tweaks.py`, then `img2simg`. Flash it with `fastboot flash userdata`. The Huawei fastboot sparse/size limits may need `-S 256M`.
+- Make the kernel IOSurface/IOMobileFramebuffer path (0046, plus topaz's copy/flip patches 0100–0103) present into the marie scanout buffer.
+- **Milestone:** Apple logo, then backboardd, then SpringBoard lock screen.
+
+## Phase 4: Input and basics
+- **Touch:**
+  - PL022 SPI driver and Kirin GPIO (CS GPIO 10, IRQ/reset GPIOs from the `novatek` node in the marie DT)
+  - Novatek protocol driver, ported from `kernel-marie/drivers/devkit/tpkit/` (the novatek ts_kit backend)
+  - feed it into sweet's HID event services (0058/0060)
+  - check whether fastboot leaves the touch rail powered; if not, the PMIC LDO has to be driven (hi6555 PMU)
+- **Power/volume keys:** `hisi_gpio_key` (volume) and the PMIC power key `hisi_on`.
+- **SMP polish, cpufreq, brightness** (`lm36274` backlight over I²C 3-0011), RTC.
+
+## Verification (per phase)
+- **Phase 0:** test bars visible; MIDR/MMFR0/GIC dump shown on the panel; the shim survives 5 minutes idle; SGI and PPI 27 delivered on CPU `0x100`.
+- **Phase 1:** CI produces `kernel.development.marie` with no LSE instructions left (`llvm-objdump -d --mattr=+v8.5a | grep -P '\t(cas|ldadd|ldset|ldclr|swp|ldapr)'`). The panel shows the XNU banner, `cpus=4`, and the ramdisk launchd test output.
+- **Phase 2:** an HFS+ root mounted read/write from `mmcblk0p70`; after reboot back to Lineage/TWRP, `fsck.hfsplus` on the image comes up clean.
+- **Phase 3:** lock screen rendered.
+- **Phase 4:** touch unlocks the lock screen.
+
+## Main risks
+1. **A73 16K granule** (checked in Phase 0). If it's missing, a 4K-page XNU is needed, against an iOS userland only ever tested on 16K pages.
+2. **Hidden watchdogs**: LPM3/system or Huawei RDR "AP alive" checks that reboot the phone without Linux running.
+3. **Scanout continuity**: Huawei fastboot may stop DSS scanout at handoff. In that case a minimal DSS/DSI bring-up is needed, based on `kernel-marie` hisifb/lcdkit for panel `MARI_130 203`.
+4. **GICv2 security setup**: interrupts the secure firmware has configured as Group 0 can't be used. This only matters if the vtimer or SGIs are among them.
+5. **Low timer frequency** (1.92 MHz) exposing XNU timing assumptions.
+6. **Fastboot quirks**: no `fastboot boot`, which makes every iteration a flash; sparse size limits for the multi-GB userdata image.
+
+## Where things live
+- This directory: the topaz fork (`shim/`, `xnu/patches/`, `tools/`, `.github/workflows/xnu.yml`) on a `marie` branch
+- `../marie/kernel-marie/`: reference drivers and DT (`sdhci_mshc_libra.c`, hisifb, tpkit/novatek, `arch/arm64/boot/dts/auto-generate/{config,overlay}/kirin710/`)
+- `../marie/clean/`: stock images for recovery
