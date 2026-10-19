@@ -46,6 +46,17 @@ All gates passed:
 - **GIC-400:** GICD_TYPER `0xFCEB` (384 IRQs, 8 CPU interfaces, SecurityExtn). The CPU interface on A73 0x100 is **#4**. GICD/GICC are already enabled for Group 1 with PMR `0xF0`. vtimer PPI 27, ptimer PPI 30 and SGI 1 are delivered as NS Group 1 IRQs (30/30/10 in 300 ms).
 - **Watchdog:** after disabling the SP805, 300 s idle with no reset.
 
+## Phase 4 milestone: touch, home screen reachable (2026-10-19)
+- **Image:** xnu 0208 (CI 39313916759, `xnu/out-0208`), `shim/out/marie-0208-touch.img`. Built with `CPUS=4 MARIE_DISPLAY=1 tools/marie-image.sh ... --args "rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 sweetfb_hz=30 sweetfb_noconsole=1"`.
+- **Shim:** downloads Huawei's Novatek firmware before xnu (`touch_prepare`). The firmware is decoded from the vendor EROFS into `research/touch/`, not in git. The vendor image is an early Huawei EROFS that neither erofs-utils 1.9 nor Linux 6.18 can read, hence the block-by-block LZ4 decode.
+- **xnu 0208:** polls the event buffer every 10 ms over SPI1 (mode 0, SSPCLK/160) and feeds SweetHID (1080x2312 panel into the 1125x2436 canvas).
+- **Result:** lock screen swipe works and the home screen is reachable. Widgets show "Waiting...", there is no RTC (date and time are wrong), and Messages shows a badge (no SIM/iMessage).
+- **Next:**
+  - speed: A73 cpufreq, eMMC ADMA, faster SPI (try `marietouchdiv=32`) and IRQ-gated touch reads
+  - power/volume keys (hi6555 PMU, gpio-keys)
+  - RTC
+  - brightness
+
 ## Touch hardware (live DT via ../marie busybox USB serial, 2026-10-19; tools/marie-serial.py --props)
 - **Controller:** Novatek NT36682A TDDI (`/ts_kit/novatek@62`, ic_type 2, x/y max 1080x2312); vci/vddio type 0, powered with the panel.
 - **Bus:** `/ts_kit`: `bus_type spi`, `bus_id 1` = **PL022 `spi@fdf08000`** (4 CS, DMA, source 41 MHz), 10 MHz, `spi-mode 1`.
