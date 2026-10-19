@@ -6,10 +6,13 @@
  *   - PSCI CPU_ON to A73 CPU 0x100 and the same registers there
  *   - GIC-400 (GICv2): Group 1 IRQ from the virtual timer (PPI 27) and SGI 1
  *   - nothing resets the AP for 5 minutes with the SP805 disabled
- * Any unexpected exception paints a blue panic screen.
+ * With an xnu payload appended (build.sh $1) the A73 boots it instead of
+ * running the probes (loader.c). Any unexpected exception paints a blue
+ * panic below the last good line.
  */
 #include <stdint.h>
 #include "console.h"
+#include "loader.h"
 
 #define SP805_BASE		0xe8a06000UL	/* kirin710_cs_config.dtsi watchdog0 */
 #define SP805_CONTROL		0x008
@@ -90,6 +93,21 @@ static const char *stage;	/* set at runtime: no absolute pointers in data */
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
 static volatile int gold_up, gold_go;
+static volatile uint64_t gold_dtb;
+
+/* build.sh appends the payload at the first 4K boundary after _end */
+extern char _end[];
+
+static int payload_present(void)
+{
+	static const char want[] = "SWEETXNU";
+	const volatile char *m = (const volatile char *)(((uintptr_t)_end + 0xfff) & ~0xfffUL);
+
+	for (int i = 0; i < 8; i++)
+		if (m[i] != want[i])
+			return 0;
+	return 1;
+}
 
 static uint64_t smc(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
 {
@@ -360,6 +378,12 @@ static void __attribute__((noreturn)) gold_main(void)
 		;
 	con_skip();
 	cpu_report("A73");
+	if (payload_present()) {
+		con_skip();
+		stage = "loader";
+		con_str("LOADER", loader_boot(gold_dtb));
+		halt();
+	}
 	con_skip();
 	test_gic();
 
@@ -391,7 +415,7 @@ void shim_main(uint64_t dtb)
 	stage = "fb";
 	fb_find();
 	con_clear(RED);
-	con_str("SHIM", "marie milestone 0: probes");
+	con_str("SHIM", payload_present() ? "marie milestone 1: xnu loader" : "marie milestone 0: probes");
 	fb_report();
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
@@ -401,6 +425,7 @@ void shim_main(uint64_t dtb)
 	cpu_report("A53");
 
 	stage = "cpu_on";
+	gold_dtb = dtb;
 	__asm__ volatile("dsb sy" ::: "memory");
 	int64_t ret = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
 	con_hex2("CPU_ON", "0x100 ret=", (uint32_t)ret, 0, 0);

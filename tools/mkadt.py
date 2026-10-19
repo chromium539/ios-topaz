@@ -3,6 +3,10 @@
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+
+--marie: Huawei P30 Lite (Kirin 710) instead, values from its live FDT and the
+milestone 0 shim (PLAN.md). [--marie-display] adds the display node (AppleCLCD,
+which still drives the topaz MDP: not before it is ported).
 """
 import hashlib, os, struct, sys
 
@@ -41,6 +45,22 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
+# marie (Huawei P30 Lite, Kirin 710). RAM: System RAM 0x2e200000-0xdfffffff is
+# above every fixed carve-out; start with 2 GiB inside it.
+MARIE_PHYS_BASE, MARIE_MEM_SIZE = 0x40000000, 0x80000000
+# GIC-400: GICD and the memory-mapped GICv2 CPU interface
+MARIE_GICD, MARIE_GICD_SIZE = 0xe82b1000, 0x1000
+MARIE_GICC, MARIE_GICC_SIZE = 0xe82b2000, 0x2000
+# Huawei fastboot's logo buffer, scanned out by DSS read channel D2
+MARIE_FB, MARIE_FB_SIZE = 0x18c00000, 0x1000000
+MARIE_FB_W, MARIE_FB_H, MARIE_FB_STRIDE = 1080, 2312, 1080 * 4
+MARIE_TIMEBASE = 1920000
+MARIE_VTIMER_INTID = 27
+MARIE_ECID = 0x4d41524945000001  # 'MARIE' + 1, synthetic
+# --marie --qemu: QEMU virt,gic-version=2 (tools/qemu-sweet.py --gic 2), with
+# the topaz QEMU RAM layout and framebuffer
+QEMU_GICV2_GICD, QEMU_GICV2_GICC = 0x08000000, 0x08010000
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -76,11 +96,18 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
+def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, marie=False, marie_display=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
+    phys_base, mem_size = ((MARIE_PHYS_BASE, MARIE_MEM_SIZE) if marie and not qemu else
+                           (MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    if marie and not qemu:
+        timebase = MARIE_TIMEBASE
+    board = 'marie' if marie else 'topaz'
+    fb, fb_size, fb_w, fb_h, fb_stride = ((MARIE_FB, MARIE_FB_SIZE, MARIE_FB_W, MARIE_FB_H, MARIE_FB_STRIDE)
+                                          if marie and not qemu else (FB, FB_SIZE, FB_W, FB_H, FB_STRIDE))
+    marie_gicd, marie_gicc = (QEMU_GICV2_GICD, QEMU_GICV2_GICC) if qemu else (MARIE_GICD, MARIE_GICC)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
     ph = lambda: ('AAPL,phandle', u32(next(phandle)))
@@ -91,8 +118,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('firmware-version', cstr('topaz-shim')),
-        ('system-firmware-version', cstr('topaz-shim')),
+        ('firmware-version', cstr(board + '-shim')),
+        ('system-firmware-version', cstr(board + '-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -110,7 +137,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', MARIE_ECID if marie else SWEET_ECID)),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -138,7 +165,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo260') + cstr('qcom,kryo470') + cstr('ARM,v8')),
+            # SweetCPU's IONameMatch is qcom,kryo470 on every board
+            ('compatible', (cstr('arm,cortex-a73') if marie else cstr('qcom,kryo260')) + cstr('qcom,kryo470') + cstr('ARM,v8')),
             ('reg', u32(core if qemu else 0x100 | core)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
@@ -149,7 +177,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             ('l3-cache-id', u32(0)),
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2803200000)),
+            ('clock-frequency', u32(2200000000 if marie else 2803200000)),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -165,6 +193,15 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
+    if marie:
+        # xnu 0200: GICv2, reg = <GICD, size, GICC, size> relative to the SoC base
+        gic = node('gic', [
+            ph(),
+            ('compatible', cstr('arm,gic-400')),
+            ('interrupt-controller', b''),
+            ('virtual-timer-intid', u32(MARIE_VTIMER_INTID)),
+            ('reg', u64(marie_gicd - SOC_BASE, MARIE_GICD_SIZE, marie_gicc - SOC_BASE, MARIE_GICC_SIZE)),
+        ])
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('sweet-io')),
@@ -176,7 +213,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
         # otherwise crashes trying to set the PMU boot stage (customer builds
         # ignore the -wdt_no_pmu boot-arg).
-        node('wdt', [ph(), ('no-pmu', u32(1))]),
+        node('wdt', [ph(), ('no-pmu', u32(1))])] + ([] if marie and not marie_display else [
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
@@ -190,14 +227,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             # backboardd ask for a hardware scaler that does not exist)
             ('canvas-width', u32(1080 if native else 1125)),
             ('canvas-height', u32(2400 if native else 2436)),
-        ])])
+        ])]))
 
     fbcon = node('sweet-fbcon', [
         ph(),
-        ('reg', u64(FB, FB_SIZE)),
-        ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
-        ('stride', u32(FB_STRIDE)),
+        ('reg', u64(fb, fb_size)),
+        ('width', u32(fb_w)),
+        ('height', u32(fb_h)),
+        ('stride', u32(fb_stride)),
     ])
 
     # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
@@ -231,19 +268,22 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') +
+         (cstr('huawei,marie') if marie else cstr('xiaomi,topaz')) + cstr('xiaomi,sweet') +
+         (cstr('hisilicon,kirin710') if marie else cstr('qcom,khaje')) + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or marie else [ufs]))
 
 
 if __name__ == '__main__':
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
-                 native='--native' in sys.argv, midmem='--midmem' in sys.argv)
+                 native='--native' in sys.argv, midmem='--midmem' in sys.argv,
+                 marie='--marie' in sys.argv, marie_display='--marie-display' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

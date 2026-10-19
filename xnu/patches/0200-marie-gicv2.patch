@@ -1,0 +1,306 @@
+marie: GIC-400 (GICv2) backend for the Kirin 710
+
+Huawei P30 Lite: memory-mapped GICv2 CPU interface instead of GICv3
+system registers. TrustZone owns Group 0; the virtual timer (INTID 27) and
+SGI1 are non-secure Group 1 IRQs, as the milestone 0 shim measured. GICv2
+SGIs target CPU interfaces (GICD_ITARGETSR0, banked), and GICC_IAR carries
+the SGI source CPU in bits 12:10, so sleh_irq masks the INTID to 10 bits.
+
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 96c557b..fa36e0f 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -19,6 +19,9 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
++#if SWEET_GICV2
++extern "C" void sweet_gic_send_sgi(unsigned int cpu, uint64_t mpidr, unsigned int sgi);
++#endif
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ 
+ class SweetCPU;
+@@ -220,6 +223,11 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	}
+ 	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+ 	uint64_t mpidr = topology->cpus[logical].phys_id;
++#if SWEET_GICV2
++	/* GICv2 targets CPU interfaces, not affinities: pe_fiq.c maps them */
++	sweet_gic_send_sgi(logical, mpidr, SWEET_IPI_SGI);
++	__builtin_arm_isb(ISB_SY);
++#else
+ 	unsigned int aff0 = mpidr & 0xff;
+ 	if (aff0 >= 16) {
+ 		panic("SWEET CPU: SGI target requires unsupported range selector");
+@@ -231,6 +239,7 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	__builtin_arm_isb(ISB_SY);
++#endif /* SWEET_GICV2 */
+ }
+ 
+ kern_return_t
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index a2a8c1b..47c175b 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1939,8 +1939,16 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
++#if SWEET_GICV2
++	/* GICv2: bits 12:10 of GICC_IAR are the SGI source CPU, keep them for EOI */
++	uint32_t iar = sweet_gic_ack();
++	uint32_t intid = iar & GICC_IAR_INTID_MASK;
++#define SWEET_EOI(v) sweet_gic_eoi(v)
++#else
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++#define SWEET_EOI(v) __builtin_arm_wsr64("ICC_EOIR1_EL1", (v))
++#endif
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+@@ -1951,11 +1959,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_EOI(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_EOI(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1966,9 +1974,10 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_EOI(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
++#undef SWEET_EOI
+ #else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..5e80240 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -11,6 +11,9 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#if SWEET_GICV2
++#include <pexpert/arm/protos.h>
++#endif
+ 
+ 
+ #if HAS_GIC_V3
+@@ -222,6 +225,129 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++#elif SWEET_GICV2
++/*
++ * marie: GIC-400 (GICv2). Huawei's firmware hands over with the distributor
++ * and the boot CPU's interface already enabled for Group 1 and PMR 0xF0
++ * (milestone 0); secure firmware keeps GICD_IGROUPRn, which read as zero
++ * from the non-secure side. The ADT reg is <GICD base, size, GICC base,
++ * size>, relative to the SoC base like the GICv3 node.
++ */
++SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++
++static vm_offset_t gicd_base;
++static vm_offset_t gicc_base;
++/* Each logical CPU's GICD_ITARGETSR0 byte: its CPU interface bit (banked) */
++static volatile uint8_t gic_cpu_target[MAX_CPUS];
++
++#define gicd_read32(offset) (*(volatile uint32_t *)(gicd_base + (offset)))
++#define gicd_write32(offset, data) (*(volatile uint32_t *)(gicd_base + (offset)) = (data))
++#define gicc_read32(offset) (*(volatile uint32_t *)(gicc_base + (offset)))
++#define gicc_write32(offset, data) (*(volatile uint32_t *)(gicc_base + (offset)) = (data))
++
++uint32_t
++sweet_gic_ack(void)
++{
++	return gicc_read32(GICC_IAR);
++}
++
++void
++sweet_gic_eoi(uint32_t iar)
++{
++	gicc_write32(GICC_EOIR, iar);
++}
++
++void
++sweet_gic_send_sgi(unsigned int cpu, uint64_t mpidr, unsigned int sgi)
++{
++	uint8_t target = cpu < MAX_CPUS ? gic_cpu_target[cpu] : 0;
++
++	if (target == 0) {
++		/* Not through pe_init_fiq yet: Kirin numbers interfaces cluster * 4 + core */
++		target = (uint8_t)(1U << ((((mpidr >> 8) & 0xff) * 4 + (mpidr & 0xff)) & 7));
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	gicd_write32(GICD_SGIR, ((uint32_t)target << GICD_SGIR_TARGET_SHIFT) | sgi);
++}
++
++void
++pe_init_fiq()
++{
++	int error;
++	DTEntry entry;
++
++	// Boot CPU only: SecureDT* routines are not thread-safe (see GICv3 path).
++	if (!gicd_base) {
++		error = SecureDTLookupEntry(NULL, "/arm-io/gic", &entry);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++
++		void const *prop;
++		unsigned int prop_size;
++		error = SecureDTGetProperty(entry, "reg", &prop, &prop_size);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC MMIO regions in DT", __func__);
++		}
++
++		// GICD base, GICD size, GICC base, GICC size
++		if (prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
++		}
++
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
++			if (timer_size != sizeof(uint32_t)) {
++				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
++			}
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			sweet_vtimer_intid = intid;
++		}
++
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++		uint64_t const *reg = (uint64_t const *) prop;
++
++		gicd_base = ml_io_map(soc_base_phys + reg[0], reg[1]);
++		if (!gicd_base) {
++			panic("%s: cannot map GICD region", __func__);
++		}
++		gicc_base = ml_io_map(soc_base_phys + reg[2], reg[3]);
++		if (!gicc_base) {
++			panic("%s: cannot map GICC region", __func__);
++		}
++		kprintf("SWEET GIC: GICv2 typer 0x%x, virtual timer INTID %u\n",
++		    gicd_read32(GICD_TYPER), sweet_vtimer_intid);
++	}
++
++	// SGIs and PPIs (INTIDs 0-31) are banked per CPU interface
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICD_IPRIORITYR0 + i, 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++
++	unsigned int cpu = ml_get_cpu_number_local();
++	if (cpu < MAX_CPUS) {
++		gic_cpu_target[cpu] = (uint8_t)(gicd_read32(GICD_ITARGETSR0) & 0xff);
++		__builtin_arm_dmb(DMB_ISH);
++	}
++
++	gicc_write32(GICC_PMR, 0xF0);
++	gicc_write32(GICC_BPR, 0);
++
++	// Non-secure view: bit 0 of GICD_CTLR is EnableGrp1
++	gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1);
++
++	// EOImodeNS 0: a write to GICC_EOIR also deactivates
++	uint32_t gicc_ctlr = gicc_read32(GICC_CTLR);
++	gicc_ctlr &= ~GICC_CTLR_EOIMODENS;
++	gicc_ctlr |= GICC_CTLR_ENABLEGRP1;
++	gicc_write32(GICC_CTLR, gicc_ctlr);
++	__builtin_arm_isb(ISB_SY);
++}
+ #else
+ void
+ pe_init_fiq()
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..39b8eb4 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -38,6 +38,10 @@ int uart_getc(void);
+ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
++/* GICv2 (SWEET_GICV2) CPU interface; see pe_fiq.c */
++uint32_t sweet_gic_ack(void);
++void sweet_gic_eoi(uint32_t iar);
++void sweet_gic_send_sgi(unsigned int cpu, uint64_t mpidr, unsigned int sgi);
+ #endif
+ 
+ #ifdef PRIVATE
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 424e1c0..28ee8eb 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -37,7 +37,13 @@
+ /* topaz: Cortex-A53/A73 have no PAN (ARMv8.1); MSR PAN is undefined there */
+ #define __ARM_16K_PG__            1
+ 
+-#define HAS_GIC_V3                1
++/*
++ * marie (Huawei P30 Lite, Kirin 710): the GIC is a GIC-400, i.e. GICv2 with
++ * a memory-mapped CPU interface (GICD 0xE82B1000, GICC 0xE82B2000) instead
++ * of GICv3 system registers. Same model as above: Group 0 is TrustZone's,
++ * everything xnu uses is a non-secure Group 1 IRQ (see pe_fiq.c).
++ */
++#define SWEET_GICV2               1
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+@@ -48,7 +54,12 @@
+  * virt, hyp) instead of the usual 13/14/11/10: the virtual timer XNU uses
+  * (CNTV) is INTID 16 + 3 = 19.
+  */
++#if SWEET_GICV2
++/* Kirin 710 uses the usual numbering: virtual timer PPI 11 = INTID 27 */
++#define SWEET_VTIMER_INTID        27
++#else
+ #define SWEET_VTIMER_INTID        19
++#endif
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+@@ -81,4 +92,25 @@
+ #define ICC_SRE_SRE                             0x1
+ /* End of GICv3 register definitions */
+ 
++/* GICv2 register definitions; see GICv2 spec (Arm IHI 0048B) */
++#define GICD_TYPER                0x004
++#define GICD_ISENABLER0           0x100
++#define GICD_IPRIORITYR0          0x400
++#define GICD_ITARGETSR0           0x800
++#define GICD_SGIR                 0xf00
++#define GICD_SGIR_TARGET_SHIFT    16
++
++#define GICC_CTLR                 0x000
++#define GICC_PMR                  0x004
++#define GICC_BPR                  0x008
++#define GICC_IAR                  0x00c
++#define GICC_EOIR                 0x010
++
++/* Non-secure view of GICC_CTLR */
++#define GICC_CTLR_ENABLEGRP1      0x1
++#define GICC_CTLR_EOIMODENS       0x200
++
++#define GICC_IAR_INTID_MASK       0x3ff   /* bits 12:10 = SGI source CPU */
++/* End of GICv2 register definitions */
++
+ #endif /* ! _PEXPERT_ARM64_SWEET_H */

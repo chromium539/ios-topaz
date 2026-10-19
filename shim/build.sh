@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 CC="clang --target=aarch64-none-elf"
 OBJCOPY=llvm-objcopy
 CFLAGS="-O2 -mcpu=cortex-a53 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-jump-tables -Wall -Wextra"
-OBJS="start shim console"
+OBJS="start shim console loader fdt"
 mkdir -p out
 for f in $OBJS; do
 	src=$f.c
