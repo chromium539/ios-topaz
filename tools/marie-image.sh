@@ -16,9 +16,11 @@ while [ $# -gt 0 ]; do
 	*) echo "unknown option $1" >&2; exit 1 ;;
 	esac
 done
-# Topaz drivers that touch Qualcomm hardware stay off: no UFS root, no fuel
-# gauge (Qualcomm I2C) and no cpufreq (Qualcomm LUT) on the Kirin 710.
-args="debug=0xc serial=3 cpus=${CPUS:-1} keepsyms=1 -noprogress sweetbattery=0 sweetcpufreq=0 wdt=-1 wdt_test=no_user_checkin"
+# Topaz drivers that touch Qualcomm hardware stay off on the Kirin 710: no
+# fuel gauge (Qualcomm I2C), no cpufreq (Qualcomm LUT), and no touch/keys,
+# which sweet_ufs.c starts with the root device (their TLMM/GCC/SPMI
+# addresses are plain low DRAM here).
+args="debug=0xc serial=3 cpus=${CPUS:-1} keepsyms=1 -noprogress sweetbattery=0 sweetcpufreq=0 sweettouch=0 sweetkeys=0 wdt=-1 wdt_test=no_user_checkin"
 rdarg=()
 if [ -n "$ramdisk" ]; then
 	args="$args rd=md0"
