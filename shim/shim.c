@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include "console.h"
 #include "loader.h"
+#include "emmc.h"
 
 #define SP805_BASE		0xe8a06000UL	/* kirin710_cs_config.dtsi watchdog0 */
 #define SP805_CONTROL		0x008
@@ -94,6 +95,7 @@ static const char *stage;	/* set at runtime: no absolute pointers in data */
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
 static volatile int gold_up, gold_go;
+static volatile uint64_t sib_mpidr[8];	/* CPU_ON test: woken A73 siblings */
 static volatile uint64_t gold_dtb;
 
 /* build.sh appends the payload at the first 4K boundary after _end */
@@ -292,16 +294,7 @@ static void fb_report(void)
 	else
 		con_str("FB", "no read channel with a physical RAM address");
 	con_hex2("OVL0", "size=", ovl_size, "ok=", ovl_ok);
-	for (unsigned i = 0; i < NR_RCH; i++) {
-		char label[] = "RCH0";
-		label[3] = '0' + i;
-		if (!rch_ok[i]) {
-			con_str(label, "abort (powered down)");
-			continue;
-		}
-		con_hex2(label, "a=", rch_addr[i], "s=", rch_stride[i]);
-		con_hex2("", "ctrl=", rch_ctrl[i], 0, 0);
-	}
+	/* per-channel dump: milestone 0 photos (only D2 = RCH7 is live) */
 }
 
 /* ---- GIC-400 (GICv2) + timer ---- */
@@ -356,7 +349,7 @@ static void irq_window(const char *label, int src)
 	con_hex2(" pre", "last=", irq_last, 0, 0);
 }
 
-static void test_gic(void)
+static void __attribute__((unused)) test_gic(void)
 {
 	stage = "gic regs";
 	con_hex2("GICD", "ctlr=", rd32(GICD_BASE + GICD_CTLR), "typer=", rd32(GICD_BASE + GICD_TYPER));
@@ -405,6 +398,8 @@ static void cpu_report(const char *label)
  * The boot CPU is A53 CPU 0 (no 16K granule if Cortex-A53 behaves as on
  * topaz). The A73 at MPIDR 0x100 is where xnu will have to run.
  */
+static void test_sibling_cpu_on(void);
+
 static void __attribute__((noreturn)) gold_main(void)
 {
 	gold_up = 1;
@@ -415,16 +410,20 @@ static void __attribute__((noreturn)) gold_main(void)
 	cpu_report("A73");
 	if (payload_present()) {
 		con_skip();
-		/* mkadt.py --marie hard-codes these for xnu's secondary CPUs */
+		/* loader.c writes these into the ADT for xnu's secondary CPUs */
 		con_hex2("TRAMP", "pa=", (uintptr_t)xnu_psci_tramp, "mbox=", (uintptr_t)xnu_psci_mailbox);
-		if ((uintptr_t)xnu_psci_tramp != 0x80400 || (uintptr_t)xnu_psci_mailbox != 0x80408)
-			con_str("TRAMP", "NOT at 0x80400/0x80408: cpus>1 will fail");
 		stage = "loader";
 		con_str("LOADER", loader_boot(gold_dtb));
 		halt();
 	}
+	/* Milestone 2: sibling CPU_ON and eMMC probes instead of the GIC/watchdog checks */
 	con_skip();
-	test_gic();
+	stage = "cpu_on sib";
+	test_sibling_cpu_on();
+	con_skip();
+	stage = "emmc";
+	test_emmc();
+	halt();
 
 	/* Watchdog check: nothing pets anything from here on. */
 	stage = "idle";
@@ -443,8 +442,56 @@ static void __attribute__((noreturn)) gold_main(void)
 
 void secondary_main(uint64_t idx)
 {
-	(void)idx;
+	if (idx >= 5 && idx < 8) {	/* A73 sibling from the CPU_ON test: report and power off */
+		sib_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
+		__asm__ volatile("dsb sy" ::: "memory");
+		smc(PSCI_CPU_OFF, 0, 0, 0);
+		for (;;)
+			__asm__ volatile("wfi");
+	}
 	gold_main();
+}
+
+/*
+ * xnu's CPU_ON returned -9 (INVALID_ADDRESS) for its entry (0x414b8000) and
+ * the trampoline at 0x80400, while 0x80848 (secondary_entry) works. Map what
+ * Huawei's PSCI accepts: a 16-byte stub (ldr x1, =secondary_entry; br x1) at
+ * each address, CPU_ON 0x101 there; the sibling records itself and powers
+ * off again (secondary_main), so the next address can be tried.
+ */
+static const uint64_t onaddr[] = {
+	0x80400, 0x80848, 0x98000, 0x100000, 0x200000, 0x1000000, 0x4000000,
+	0xff00000, 0x2e300000, 0x40000000, 0x80000000, 0xc0000000, 0x200000000,
+};
+
+static void test_sibling_cpu_on(void)
+{
+	*(volatile uint64_t *)xnu_psci_mailbox = (uintptr_t)secondary_entry;
+	for (unsigned i = 0; i < sizeof(onaddr) / sizeof(onaddr[0]); i++) {
+		uint64_t a = onaddr[i];
+		if (a != 0x80400 && a != 0x80848) {
+			volatile uint32_t *w = (volatile uint32_t *)a;
+			w[0] = 0x58000041;	/* ldr x1, #8 */
+			w[1] = 0xd61f0020;	/* br x1 */
+			w[2] = (uint32_t)(uintptr_t)secondary_entry;
+			w[3] = 0;
+		}
+		sib_mpidr[5] = 0;
+		__asm__ volatile("dsb sy; isb" ::: "memory");
+		int64_t r = smc(PSCI_CPU_ON, 0x101, a, 5);
+		uint64_t end = now() + rsr("cntfrq_el0") / 5;	/* 200 ms */
+		while (r == 0 && !sib_mpidr[5] && now() < end)
+			;
+		/* wait for it to be OFF again (AFFINITY_INFO 1) */
+		end = now() + rsr("cntfrq_el0") / 5;
+		while (r == 0 && smc(0xc4000004UL, 0x101, 0, 0) != 1 && now() < end)
+			;
+		char label[] = "ON 00";
+		label[3] = "0123456789abcdef"[i >> 4];
+		label[4] = "0123456789abcdef"[i & 15];
+		con_hex2(label, "a=", (uint32_t)(a >> 4), "ret/up=", (uint32_t)r ^ (sib_mpidr[5] ? 0x10000000u : 0));
+	}
+	con_str("ON", "a= is addr>>4; ret/up=1xxxxxxx: came up");
 }
 
 void shim_main(uint64_t dtb)

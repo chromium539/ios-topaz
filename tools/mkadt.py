@@ -57,9 +57,10 @@ MARIE_FB_W, MARIE_FB_H, MARIE_FB_STRIDE = 1080, 2312, 1080 * 4
 MARIE_TIMEBASE = 1920000
 MARIE_VTIMER_INTID = 27
 MARIE_ECID = 0x4d41524945000001  # 'MARIE' + 1, synthetic
-# Huawei PSCI rejects CPU_ON entries in xnu's RAM; shim/start.S keeps a
-# trampoline + mailbox at Image+0x400 (Image loaded at 0x80000)
-MARIE_PSCI_TRAMP, MARIE_PSCI_MAILBOX = 0x80400, 0x80408
+# Huawei PSCI only accepts CPU_ON entries inside the loaded kernel image;
+# shim/start.S has a trampoline + mailbox there. Placeholders: shim/loader.c
+# writes the real addresses into every CPU's property at boot.
+MARIE_PSCI_TRAMP, MARIE_PSCI_MAILBOX = 0, 0
 # --marie --qemu: QEMU virt,gic-version=2 (tools/qemu-sweet.py --gic 2), with
 # the topaz QEMU RAM layout and framebuffer
 QEMU_GICV2_GICD, QEMU_GICV2_GICC = 0x08000000, 0x08010000

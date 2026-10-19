@@ -76,6 +76,41 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/*
+ * marie: point the ADT's CPU property "sweet,psci-trampoline" (placeholder
+ * from mkadt.py) at this image's trampoline and mailbox (start.S): Huawei's
+ * PSCI only accepts CPU_ON entries inside the loaded kernel image. ADT
+ * property: char name[32], u32 length (bit 31 = placeholder flag), value.
+ */
+extern char xnu_psci_tramp[], xnu_psci_mailbox[];
+
+static int adt_patch_tramp(uintptr_t adt, uint64_t size)
+{
+	static const char want[] = "sweet,psci-trampoline";
+	int n = 0;
+
+	for (uint64_t off = 0; off + 32 + 4 + 16 <= size; off += 4) {
+		volatile const char *name = (volatile const char *)(adt + off);
+		int i;
+		for (i = 0; i < (int)sizeof(want); i++)
+			if (name[i] != want[i])
+				break;
+		if (i != sizeof(want))
+			continue;
+		volatile uint32_t *len = (volatile uint32_t *)(adt + off + 32);
+		if ((*len & 0x7fffffff) != 16)
+			continue;
+		volatile uint32_t *v = (volatile uint32_t *)(adt + off + 36);	/* 4-aligned only */
+		uint64_t t = (uintptr_t)xnu_psci_tramp, m = (uintptr_t)xnu_psci_mailbox;
+		v[0] = (uint32_t)t;
+		v[1] = (uint32_t)(t >> 32);
+		v[2] = (uint32_t)m;
+		v[3] = (uint32_t)(m >> 32);
+		n++;
+	}
+	return n;
+}
+
 /* build.sh appends the payload to the Image at the first 4K boundary after _end */
 extern char _end[];
 
@@ -151,6 +186,7 @@ const char *loader_boot(uintptr_t dtb)
 	/* ADT, then boot_args, behind the kernel; everything below topOfKernelData is ours. */
 	uintptr_t adt_pa = p->kernel_end + pa_of_va_base;
 	copy64(adt_pa, rd_start + p->adt_off, p->adt_size);
+	con_hex2("ADT", "tramp props=", adt_patch_tramp(adt_pa, p->adt_size), "tramp=", (uintptr_t)xnu_psci_tramp);
 	uintptr_t ba_pa = (adt_pa + p->adt_size + PAGE_16K - 1) & ~(PAGE_16K - 1);
 	uintptr_t top = ba_pa + PAGE_16K;
 

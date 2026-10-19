@@ -2,8 +2,7 @@ ENTRY(_head)
 SECTIONS
 {
 	. = 0;
-	/* marie: the PSCI trampoline sits at a fixed offset (mkadt.py MARIE_PSCI_TRAMP) */
-	.text : { *(.text.head) . = 0x400; KEEP(*(.text.tramp)) *(.text*) }
+	.text : { *(.text.head) *(.text*) }
 	.rodata : { *(.rodata*) }
 	.data : { *(.data*) }
 	. = ALIGN(16);

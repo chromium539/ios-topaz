@@ -16,22 +16,6 @@ _head:
 	.ascii	"ARM\x64"		/* magic */
 	.long	0			/* res5 (PE offset) */
 
-/*
- * marie: Huawei's PSCI rejects CPU_ON entry points in xnu's RAM window
- * (rc -9). xnu (SweetCPU, ADT "sweet,psci-trampoline") stores its real
- * secondary entry in the mailbox and points CPU_ON here instead; this image
- * stays at its load address (0x80000) below xnu's RAM. MMU off, x0 = context.
- */
-	.section .text.tramp, "ax"
-	.globl xnu_psci_tramp
-xnu_psci_tramp:
-	ldr	x1, xnu_psci_mailbox
-	br	x1
-	.balign	8
-	.globl xnu_psci_mailbox
-xnu_psci_mailbox:
-	.quad	0
-
 	.text
 	.globl _start
 _start:
@@ -70,6 +54,22 @@ secondary_entry:
 	bl	secondary_main
 4:	wfe
 	b	4b
+
+/*
+ * marie: Huawei's PSCI only accepts CPU_ON entry points inside the loaded
+ * kernel image, past its first page or so (milestone 2 sweep: 0x80848 ok;
+ * 0x80400, 0x98000 past _end and xnu's 0x414b8000 all -9). xnu (SweetCPU,
+ * ADT "sweet,psci-trampoline", patched in by loader.c) stores its real
+ * secondary entry in the mailbox and points CPU_ON here. MMU off, x0 = context.
+ */
+	.globl xnu_psci_tramp
+xnu_psci_tramp:
+	ldr	x1, xnu_psci_mailbox
+	br	x1
+	.balign	8
+	.globl xnu_psci_mailbox
+xnu_psci_mailbox:
+	.quad	0
 
 /*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number
