@@ -46,6 +46,16 @@ All gates passed:
 - **GIC-400:** GICD_TYPER `0xFCEB` (384 IRQs, 8 CPU interfaces, SecurityExtn). The CPU interface on A73 0x100 is **#4**. GICD/GICC are already enabled for Group 1 with PMR `0xF0`. vtimer PPI 27, ptimer PPI 30 and SGI 1 are delivered as NS Group 1 IRQs (30/30/10 in 300 ms).
 - **Watchdog:** after disabling the SP805, 300 s idle with no reset.
 
+## SMP and eMMC findings (2026-10-19, photos IMG_1912-1920)
+- **4 A73 cores up** (`cpus=4`, photo IMG_1920).
+  - Huawei PSCI returns -9 INVALID_ADDRESS for every CPU_ON entry point except the one used by the **first CPU_ON after boot** (the shim's A53 -> 0x100 call at `secondary_entry`, 0x80848). Tested: 0x80400, 0x80878, 0x98000 and RAM up to 0x200000000 all rejected.
+  - Fix: `secondary_entry` is xnu's trampoline. xnu writes its entry into the mailbox (ADT CPU property `sweet,psci-trampoline`, patched in by `shim/loader.c`) and calls CPU_ON at 0x80848 (xnu 0204).
+- **eMMC** (shim probe `shim/emmc.c`, photo IMG_1915):
+  - SDHCI registers at **0xFF3E6000** (DT reg[0]; 0xFF3E1000 is the PHY), SDHCI 4.10
+  - card RCA 1 in transfer state, HS400 (HS_TIMING 3), CMDQ off, PARTITION_CONFIG 0x08 (user area), 0x0E8F6000 sectors
+  - GPT entry 70 `userdata` = LBA 0x0111C000-0x0E8F5FFF (~116 GB)
+  - PIO CMD13/CMD8/CMD17 work from fastboot's state. xnu 0205 = SDHCI PIO backend for sweet_ufs.c (`rd=ufsroot0`).
+
 ## Phase 1 milestone: XNU to PID 1 on the phone (2026-10-19, photos IMG_1910/1911)
 Kernel xnu 0201+0202+0203 (CI run 39294487743, `xnu/out-0203`), image `shim/out/marie-0203c.img`. Boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress sweetbattery=0 sweetcpufreq=0 wdt=-1 wdt_test=no_user_checkin rd=md0`. ADT: `mkadt.py --marie`. RAM disk: `research/init/sweet-init` (mockfs root).
 Result: A73 0x100 alive, SGI1 verified through the GICv2 backend, `BSD root: md0`, `*** SWEET userspace: init running as PID 1 ***` and 5 s heartbeats.
