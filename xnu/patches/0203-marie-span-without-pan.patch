@@ -1,0 +1,7 @@
+marie: keep PAN unchanged on exception entry when built without PAN
+
+SPAN is RES1 on the ARMv8.0 A73, so the phone is unaffected. QEMU's
+cortex-a76 has PAN: with SPAN=0 every exception set PSTATE.PAN and the
+kernel, which never clears it, faulted forever in copyout (16.5M data
+aborts at bcopyout in skmem init).
+
