@@ -208,6 +208,40 @@ static void sp805_disable(void)
 	(void)rd32(SP805_BASE + SP805_LOCK);
 }
 
+/* ---- caches ---- */
+
+/*
+ * Fastboot ran on this A53 with the D-cache on; we run with it off and the
+ * A73 writes the kernel straight to DRAM. Clean+invalidate every data cache
+ * level by set/way so no dirty line from fastboot can later be written back
+ * over xnu, or be served to the A73 by a coherent snoop once xnu turns its
+ * caches on. (The Linux boot protocol only cleans the kernel image itself.)
+ */
+static void dcache_cisw_all(void)
+{
+	uint64_t clidr = rsr("clidr_el1");
+	unsigned int loc = (clidr >> 24) & 7;
+
+	for (unsigned int level = 0; level < loc; level++) {
+		if (((clidr >> (level * 3)) & 7) < 2)
+			continue;	/* no data or unified cache at this level */
+		wsr("csselr_el1", level << 1);
+		isb();
+		uint64_t ccsidr = rsr("ccsidr_el1");
+		unsigned int line_shift = (ccsidr & 7) + 4;
+		uint32_t ways = (ccsidr >> 3) & 0x3ff;
+		uint32_t sets = (ccsidr >> 13) & 0x7fff;
+		unsigned int way_shift = ways ? __builtin_clz(ways) : 0;
+
+		for (uint32_t set = 0; set <= sets; set++)
+			for (uint32_t way = 0; way <= ways; way++) {
+				uint64_t v = (uint64_t)way << way_shift | (uint64_t)set << line_shift | level << 1;
+				__asm__ volatile("dc cisw, %0" : : "r"(v) : "memory");
+			}
+	}
+	__asm__ volatile("dsb sy; isb" ::: "memory");
+}
+
 /* ---- display: find what the DSS read channels scan out ---- */
 
 static const uint32_t rch_off[] = {
@@ -423,6 +457,10 @@ void shim_main(uint64_t dtb)
 	stage = "psci";
 	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
 	cpu_report("A53");
+
+	stage = "dcache";
+	dcache_cisw_all();
+	con_hex2("DCACHE", "clidr=", (uint32_t)rsr("clidr_el1"), "cleaned=", 1);
 
 	stage = "cpu_on";
 	gold_dtb = dtb;
