@@ -1,0 +1,227 @@
+marie: Novatek NT36682A touch over SPI1 into the sweet HID digitizer
+
+The shim downloads the touch firmware (it worked bare-metal: 734 reports,
+correct coordinates); xnu only polls the event buffer over PL022 SPI1
+(mode 0, GPIO chip select) and feeds fingers through touch_report() to
+sweet_hid_touch. SweetHID maps marie's 1080x2312 panel into the presented
+1125x2436 canvas. Boot-args: marietouchdiv (SSPCLK divider, default 160),
+marietouchirq=1 (read only while the IRQ GPIO is low), marietouchms.
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 154ebbd..fd624ac 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -737,6 +737,131 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++#if SWEET_MARIE
++/*
++ * marie (Huawei P30 Lite, Kirin 710): Novatek NT36682A TDDI on PL022 SPI1
++ * (spi@fdf08000) in mode 0, chip select on PL061 gpio@e8a0c000 pin 2, IRQ on
++ * gpio@fff0f000 pin 2. The shim enables the SPI1 clock, releases the touch
++ * reset and downloads Huawei's firmware before xnu starts (shim/touch.c,
++ * PLAN.md "Touch hardware"); here only the event buffer is read.
++ * Event buffer (NT36672A map, page 0x21C00): 6 bytes per finger,
++ * id << 3 | state (1 down, 2 move, 3 up), x[11:4], y[11:4], x[3:0] << 4 | y[3:0].
++ */
++#define MT_SPI_PA       0xfdf08000u
++#define MT_CS_PA        0xe8a0c000u
++#define MT_IRQ_PA       0xfff0f000u
++#define MT_SSPCR0       0x00u
++#define MT_SSPCR1       0x04u
++#define MT_SSPDR        0x08u
++#define MT_SSPSR        0x0cu
++#define MT_SSPCPSR      0x10u
++#define MT_SR_TNF       (1u << 1)
++#define MT_SR_RNE       (1u << 2)
++#define MT_PIN2         (4u << 2)       /* PL061 masked data address of pin 2 */
++#define MT_EVENT_BUF    0x21c00u
++#define MT_FINGERS      10u
++#define MT_PANEL_W      1080
++#define MT_PANEL_H      2312
++
++static vm_offset_t mt_spi, mt_cs, mt_irq;
++
++/* One chip-select frame, n bytes each way; false on a stuck FIFO. */
++static bool
++mt_xfer(const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	bool ok = true;
++	touch_wr(mt_cs, MT_PIN2, 0);
++	for (unsigned i = 0; i < n && ok; ++i) {
++		unsigned t = 100000;
++		while (!(touch_rd(mt_spi, MT_SSPSR) & MT_SR_TNF) && --t) {
++		}
++		touch_wr(mt_spi, MT_SSPDR, tx[i]);
++		while (t && !(touch_rd(mt_spi, MT_SSPSR) & MT_SR_RNE) && --t) {
++		}
++		ok = t != 0;
++		rx[i] = (uint8_t)touch_rd(mt_spi, MT_SSPDR);
++	}
++	touch_wr(mt_cs, MT_PIN2, 0xff);
++	return ok;
++}
++
++/* Page select, then n bytes from offset 0 of the event buffer (data from rx[2]). */
++static bool
++mt_read_events(uint8_t *out, unsigned n)
++{
++	uint8_t page[3] = { 0xff, (uint8_t)(MT_EVENT_BUF >> 15), (uint8_t)(MT_EVENT_BUF >> 7) }, junk[3];
++	uint8_t tx[64] = { 0 }, rx[64];
++	if (n + 2 > sizeof(tx) || !mt_xfer(page, junk, 3) || !mt_xfer(tx, rx, n + 2)) {
++		return false;
++	}
++	memcpy(out, rx + 2, n);
++	return true;
++}
++
++static void
++mt_thread(__unused void *arg, __unused wait_result_t result)
++{
++	uint32_t div = 160, irq = 0, period = 10;
++	(void)PE_parse_boot_argn("marietouchdiv", &div, sizeof(div));      /* SSPCLK divider */
++	(void)PE_parse_boot_argn("marietouchirq", &irq, sizeof(irq));      /* 1: read only while IRQ low */
++	(void)PE_parse_boot_argn("marietouchms", &period, sizeof(period));
++	if (div < 32 || div % 16) {
++		div = 160;
++	}
++	mt_spi = ml_io_map(MT_SPI_PA, 0x1000);
++	mt_cs = ml_io_map(MT_CS_PA, 0x1000);
++	mt_irq = ml_io_map(MT_IRQ_PA, 0x1000);
++	if (!mt_spi || !mt_cs || !mt_irq) {
++		printf("SWEET TOUCH: marie: map failed\n");
++		thread_terminate(current_thread());
++		return;
++	}
++	/* 8-bit Motorola SPI, mode 0 (milestone 4 sweep): SCK = SSPCLK / (16 * (1 + scr)) */
++	touch_wr(mt_spi, MT_SSPCR1, 0);
++	touch_wr(mt_spi, MT_SSPCPSR, 16);
++	touch_wr(mt_spi, MT_SSPCR0, ((div / 16 - 1) << 8) | 7);
++	touch_wr(mt_spi, MT_SSPCR1, 1u << 1);
++	while (touch_rd(mt_spi, MT_SSPSR) & MT_SR_RNE) {
++		(void)touch_rd(mt_spi, MT_SSPDR);
++	}
++	printf("SWEET TOUCH: marie Novatek on SPI1, div %u, %s every %u ms\n",
++	    div, irq ? "IRQ-gated" : "polled", period);
++
++	unsigned errs = 0;
++	for (;;) {
++		bool pending = !(touch_rd(mt_irq, MT_PIN2) & (1u << 2));
++		if (!irq || pending || st.active) {
++			uint8_t pd[6 * MT_FINGERS];
++			int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++			uint32_t mask = 0;
++			if (!mt_read_events(pd, sizeof(pd))) {
++				if (++errs == 1 || errs % 1000 == 0) {
++					printf("SWEET TOUCH: marie SPI timeout (%u)\n", errs);
++				}
++			} else {
++				for (unsigned i = 0; i < MT_FINGERS; ++i) {
++					const uint8_t *p = pd + 6 * i;
++					unsigned id = p[0] >> 3, state = p[0] & 7;
++					if (id < 1 || id > TOUCH_MAX || (state != 1 && state != 2)) {
++						continue;
++					}
++					int px = (int)((uint32_t)p[1] << 4 | p[3] >> 4);
++					int py = (int)((uint32_t)p[2] << 4 | (p[3] & 0xf));
++					if (px >= MT_PANEL_W || py >= MT_PANEL_H) {
++						continue;
++					}
++					mask |= 1u << (id - 1);
++					x[id - 1] = px;
++					y[id - 1] = py;
++				}
++				touch_report(mask, x, y);
++			}
++		}
++		touch_wait(period);
++	}
++}
++#endif /* SWEET_MARIE */
++
+ void
+ sweet_touch_init(void)
+ {
+@@ -747,8 +872,15 @@ sweet_touch_init(void)
+ 	}
+ 	st.started = true;
+ #if SWEET_MARIE
+-	/* marie (Kirin 710): this is Qualcomm hardware; its addresses are plain DRAM there */
+-	printf("%s: not on marie\n", "SWEET TOUCH");
++	/* marie: the Novatek reader above instead of topaz's Qualcomm I2C path */
++	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
++		return;
++	}
++	if (kernel_thread_start(mt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	return;
+ #endif
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index d2f4fa1..cd129af 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -17,6 +17,7 @@
+  * every N seconds, to test the event path without input hardware.
+  */
+ #include <IOKit/IOLib.h>
++#include <pexpert/arm64/board_config.h>   /* SWEET_MARIE */
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+@@ -356,6 +357,15 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++#if SWEET_MARIE
++#define SWEET_PANEL_H       2312        /* marie: Huawei P30 Lite, 1080x2312 */
++#define SWEET_SURFACE_MM_W  69
++#define SWEET_SURFACE_MM_H  147
++#else
++#define SWEET_PANEL_H       2400
++#define SWEET_SURFACE_MM_W  68
++#define SWEET_SURFACE_MM_H  151
++#endif
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -435,13 +445,13 @@ SweetHIDTouch::start(IOService *provider)
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
++	fLogicalH = native ? SWEET_PANEL_H : 2436;
+ 	fOffX = ((fLogicalW - 1080) / 2) & ~3;           /* as SweetFramebuffer.cpp */
+-	fOffY = (fLogicalH - 2400) / 2;
++	fOffY = (fLogicalH - SWEET_PANEL_H) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	setProperty("SurfaceWidth", (unsigned long long)(SWEET_SURFACE_MM_W << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceHeight", (unsigned long long)(SWEET_SURFACE_MM_H << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
+@@ -459,7 +469,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 		return;
+ 	}
+ 	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	y = y < 0 ? 0 : (y > SWEET_PANEL_H - 1 ? SWEET_PANEL_H - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -473,7 +483,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	}
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		    y < SWEET_TOUCH_EDGE_PX || y > SWEET_PANEL_H - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
