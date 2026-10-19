@@ -39,10 +39,24 @@ _start:
 3:	wfe
 	b	3b
 
-/* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
+/*
+ * PSCI CPU_ON target. x0 = context id = cpu index (1..7).
+ *
+ * marie: Huawei's PSCI accepts only the entry point of the first CPU_ON after
+ * boot (the shim's A53 -> 0x100 call here) and returns -9 INVALID_ADDRESS for
+ * any other, even 0x30 bytes away (milestone 2 sweep, 0204 boots). So this is
+ * also xnu's trampoline: once xnu (SweetCPU, ADT "sweet,psci-trampoline",
+ * patched in by loader.c) has stored its secondary entry in the mailbox, a
+ * new CPU branches there with x0 untouched. MMU off.
+ */
 	.globl secondary_entry
+	.globl xnu_psci_tramp
 secondary_entry:
-	msr	daifset, #0xf
+xnu_psci_tramp:
+	ldr	x1, xnu_psci_mailbox
+	cbz	x1, 1f
+	br	x1
+1:	msr	daifset, #0xf
 	msr	spsel, #1
 	adr	x1, _sec_stacks
 	add	x1, x1, x0, lsl #12
@@ -55,17 +69,6 @@ secondary_entry:
 4:	wfe
 	b	4b
 
-/*
- * marie: Huawei's PSCI only accepts CPU_ON entry points inside the loaded
- * kernel image, past its first page or so (milestone 2 sweep: 0x80848 ok;
- * 0x80400, 0x98000 past _end and xnu's 0x414b8000 all -9). xnu (SweetCPU,
- * ADT "sweet,psci-trampoline", patched in by loader.c) stores its real
- * secondary entry in the mailbox and points CPU_ON here. MMU off, x0 = context.
- */
-	.globl xnu_psci_tramp
-xnu_psci_tramp:
-	ldr	x1, xnu_psci_mailbox
-	br	x1
 	.balign	8
 	.globl xnu_psci_mailbox
 xnu_psci_mailbox:

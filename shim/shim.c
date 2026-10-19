@@ -466,7 +466,7 @@ static const uint64_t onaddr[] = {
 
 static void test_sibling_cpu_on(void)
 {
-	*(volatile uint64_t *)xnu_psci_mailbox = (uintptr_t)secondary_entry;
+	/* mailbox stays 0: secondary_entry is xnu's trampoline once it is set */
 	for (unsigned i = 0; i < sizeof(onaddr) / sizeof(onaddr[0]); i++) {
 		uint64_t a = onaddr[i];
 		if (a != 0x80400 && a != 0x80848) {
