@@ -1,0 +1,55 @@
+marie: AppleCLCD without the Qualcomm MDP/DSI (CPU copy to the boot framebuffer)
+
+First iOS boot on marie: launchd, the daemons and backboardd run;
+SpringBoard crash-loops with "failed to find the main CADisplay" (no
+display node). On the Kirin the MDP VIG0/CTL0, DSI0 and INTF1 addresses
+are plain low DRAM: leave them unmapped so AppleCLCD takes its copy
+path into Huawei fastboot's logo buffer (DSS keeps scanning it out).
+No brightness control and no direct scanout yet.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4cbe94a..9f53f6e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -74,6 +74,7 @@ extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
++#include <pexpert/arm64/board_config.h>   /* SWEET_MARIE */
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+@@ -290,9 +291,21 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++#if SWEET_MARIE
++	/*
++	 * marie (Kirin 710): no Qualcomm MDP/DSI; these addresses are plain low
++	 * DRAM there. Without VIG0/CTL0/DSI/INTF1 AppleCLCD uses the copy path:
++	 * the CPU copies each iOS frame into the boot framebuffer, Huawei
++	 * fastboot's logo buffer that DSS read channel D2 keeps scanning out.
++	 */
++	fVig0 = NULL;
++	fCtl0 = NULL;
++	fDsi = NULL;
++#else
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+ 	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++#endif
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -324,7 +337,11 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(bl);
+ 	}
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
++#if SWEET_MARIE
++	fIntf1 = NULL;
++#else
+ 	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++#endif
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */

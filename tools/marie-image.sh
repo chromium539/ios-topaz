@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build a flashable marie kernel-partition image from an xnu kernel.
-#   [CPUS=n] tools/marie-image.sh KERNEL NAME [--ramdisk IMAGE] [--qemu] [--args "extra boot-args"]
+#   [CPUS=n] [MARIE_DISPLAY=1] tools/marie-image.sh KERNEL NAME [--ramdisk IMAGE] [--qemu] [--args "extra boot-args"]
 # -> shim/out/marie-NAME.img (fastboot flash kernel ...); with --qemu also
 #    boots the payload in QEMU virt,gic-version=2 into research/q-NAME/.
 set -euo pipefail
@@ -29,7 +29,8 @@ fi
 args="$args $extra"
 out=$top/shim/out
 mkdir -p "$out"
-python3 -I "$top/tools/mkadt.py" "$out/marie-$name.adt" --marie
+# MARIE_DISPLAY=1: ADT display node (AppleCLCD, IOMobileFramebuffer); needs xnu 0206+
+python3 -I "$top/tools/mkadt.py" "$out/marie-$name.adt" --marie ${MARIE_DISPLAY:+--marie-display}
 python3 -I "$top/tools/mkpayload.py" "$kernel" "$out/marie-$name.adt" "$out/payload-$name.bin" \
 	"${rdarg[@]}" --cmdline "$args"
 "$top/shim/build.sh" "$out/payload-$name.bin" >/dev/null
