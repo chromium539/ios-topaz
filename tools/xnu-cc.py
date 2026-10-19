@@ -11,7 +11,9 @@ FILTER     only compile sources whose path contains one of these strings
 Edit the sources under BUILDTREE/xnu, re-run, and turn the result into
 patches with `git diff` there. Uses the local Apple-fork clang (swiftlang).
 
-Env: XNU_CC_EXTRA   extra flags (e.g. "-DKPERF -DKPC" for config changes)
+Env: XNU_CC_CI_DXB  dxb checkout path of the CI runner (default: ios-sweet's)
+     XNU_CC_CLANG   Apple-fork clang (default ~/swift/usr/bin/clang)
+     XNU_CC_EXTRA   extra flags (e.g. "-DKPERF -DKPC" for config changes)
      XNU_CC_POST    flags appended after the original ones (like a per-object
                     _CFLAGS_ADD in the xnu Makefiles: -U/-include after -D)
      XNU_CC_OBJDIR  emit real objects there instead of a syntax-only check
@@ -20,9 +22,9 @@ Env: XNU_CC_EXTRA   extra flags (e.g. "-DKPERF -DKPC" for config changes)
 import concurrent.futures as cf, os, re, shlex, subprocess, sys
 from collections import Counter
 
-CI_DXB = '/Users/runner/work/ios-sweet/ios-sweet/dxb'
+CI_DXB = os.environ.get('XNU_CC_CI_DXB', '/Users/runner/work/ios-sweet/ios-sweet/dxb')	# fork: .../ios-topaz/ios-topaz/dxb
 CI_SDK_PLATFORM = re.compile(r'/Applications/Xcode[^ ]*?\.sdk/+System/Library/Frameworks/Kernel\.framework/Versions/A/PrivateHeaders/platform')
-CLANG = os.path.expanduser('~/swift/usr/bin/clang')
+CLANG = os.environ.get('XNU_CC_CLANG', os.path.expanduser('~/swift/usr/bin/clang'))
 DROP = {'-c', '-g', '-MD', '-MMD'}
 DROP_WITH_ARG = {'-MF', '-MT', '-o', '-arch'}
 COMPONENTS = ('osfmk', 'bsd', 'iokit', 'libkern', 'pexpert', 'security', 'san', 'libsa')

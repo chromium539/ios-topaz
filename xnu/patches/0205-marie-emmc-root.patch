@@ -1,0 +1,374 @@
+marie: eMMC root device (SDHCI PIO backend for sweet_ufs.c)
+
+The Kirin 710 eMMC host (sdhci@FF3E1000, SDHCI registers at 0xFF3E6000)
+as fastboot leaves it: card in transfer state (RCA 1), HS400, no CMDQ,
+user area (milestone 2 probe). Under SWEET_MARIE the UFS hardware layer
+is replaced by polled PIO (CMD17/18/24/25 with auto CMD12, CMD8, CMD6
+cache flush) with 512-byte device blocks; GPT lookup, partition fence
+(now covering the 34-sector primary GPT), strategy, ioctls and the
+persistent log are shared. Same node (/sweet-ufs) and rd=ufsroot0.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 143db60..06beebb 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -19,6 +19,7 @@
+  * outside the named partition can be written.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/arm64/board_config.h>
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/buf.h>
+@@ -69,7 +70,13 @@ extern void sweet_usb_probe(void);
+ #define HCS_UTRLRDY     (1u << 1)
+ #define CAP_64AS        (1u << 24)              /* 64-bit DMA addressing */
+ 
++#if SWEET_MARIE
++#define UFS_BLOCK       512u                    /* marie: eMMC sectors; GPT LBAs are 512 bytes */
++#define UFS_LUNS        1                       /* one user area (PARTITION_CONFIG access 0) */
++#else
+ #define UFS_BLOCK       4096u
++#define UFS_LUNS        6
++#endif
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+@@ -109,6 +116,7 @@ static struct {
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool emmc_cache;                        /* marie: EXT_CSD CACHE_CTRL on: flush on sync */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -129,6 +137,7 @@ ufs_wr(uint32_t off, uint32_t v)
+ 	*(volatile uint32_t *)(su.regs + off) = v;
+ }
+ 
++#if !SWEET_MARIE
+ static void
+ dma_sync(uint32_t off, uint32_t len)
+ {
+@@ -271,6 +280,186 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+ 	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
+ }
+ 
++#else /* SWEET_MARIE */
++/*
++ * marie: the eMMC behind sdhci@FF3E1000 (reg[0] 0xFF3E6000: SDHCI 4.10, the
++ * Kirin "mshc" host). Huawei fastboot hands over with the card selected (RCA
++ * 1) in transfer state, HS400 on 8 bits, command queueing off and the user
++ * area selected (milestone 2 probe, PLAN.md). This reuses that state: polled
++ * PIO through the SDHCI buffer port, one command at a time, no interrupt
++ * signals, no DMA. Data moves through the bounce buffer like the UFS path.
++ */
++#define SD_BLKSIZE      0x04            /* 16-bit block size + 16-bit count at 0x06 */
++#define SD_ARG          0x08
++#define SD_XFER         0x0c            /* 16-bit transfer mode + 16-bit command at 0x0e */
++#define SD_RESP0        0x10
++#define SD_BUFFER       0x20
++#define SD_PSTATE       0x24
++#define SD_SWRESET      0x2f            /* byte */
++#define SD_INTSTS       0x30            /* normal 16 + error 16 */
++#define SD_INTEN        0x34
++#define SD_SIGEN        0x38
++#define SD_ACMDERR      0x3c
++
++#define INT_CMD_DONE    (1u << 0)
++#define INT_XFER_DONE   (1u << 1)
++#define INT_ERROR       (1u << 15)
++#define PSTATE_CMD_INH  (1u << 0)
++#define PSTATE_DAT_INH  (1u << 1)
++#define PSTATE_BUF_WR   (1u << 10)
++#define PSTATE_BUF_RD   (1u << 11)
++#define SWRESET_CMD_DAT 0x06
++
++#define CMD_RESP48      0x02
++#define CMD_RESP48B     0x03
++#define CMD_CRC         0x08
++#define CMD_INDEX       0x10
++#define CMD_DATA        0x20
++#define CMD_R1          (CMD_RESP48 | CMD_CRC | CMD_INDEX)
++#define CMD_R1B         (CMD_RESP48B | CMD_CRC | CMD_INDEX)
++#define XFER_BLKCNT     0x02
++#define XFER_ACMD12     0x04
++#define XFER_READ       0x10
++#define XFER_MULTI      0x20
++
++#define EMMC_RCA        1               /* Linux: mmc0:0001 */
++/* Card status errors (JESD84: out of range, address, block length, WP, ECC, CC, error, illegal, switch) */
++#define R1_ERRORS       0xe4780080u
++#define EMMC_STATE(r1)  (((r1) >> 9) & 0xf)
++#define EMMC_TRAN       4
++
++static uint64_t
++emmc_deadline(uint64_t ns)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime(ns, &abs);
++	return mach_absolute_time() + abs;
++}
++
++static void
++emmc_reset_lines(void)
++{
++	*(volatile uint8_t *)(su.regs + SD_SWRESET) = SWRESET_CMD_DAT;
++	uint64_t deadline = emmc_deadline(100 * NSEC_PER_MSEC);
++	while ((*(volatile uint8_t *)(su.regs + SD_SWRESET) & SWRESET_CMD_DAT) &&
++	    mach_absolute_time() < deadline) {
++	}
++	ufs_wr(SD_INTSTS, 0xffffffff);
++}
++
++/* Wait for any of `bits` (or an error) in INT_STATUS; 0 on timeout. */
++static uint32_t
++emmc_wait_int(uint32_t bits, uint64_t deadline)
++{
++	for (;;) {
++		uint32_t st = ufs_rd(SD_INTSTS);
++		if (st & (bits | INT_ERROR)) {
++			return st;
++		}
++		if (mach_absolute_time() > deadline) {
++			return 0;
++		}
++	}
++}
++
++/* Issue one command; data phase (if any) is left to the caller. */
++static int
++emmc_cmd(uint32_t idx, uint32_t arg, uint32_t flags, uint32_t mode, uint32_t *r1)
++{
++	uint32_t inhibit = PSTATE_CMD_INH;
++	if ((flags & CMD_DATA) || (flags & 3) == CMD_RESP48B) {
++		inhibit |= PSTATE_DAT_INH;
++	}
++	uint64_t deadline = emmc_deadline(CMD_TIMEOUT_NS);
++	while (ufs_rd(SD_PSTATE) & inhibit) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET EMMC: CMD%u: lines busy (pstate 0x%x)\n", idx, ufs_rd(SD_PSTATE));
++			emmc_reset_lines();
++			return ETIMEDOUT;
++		}
++	}
++	ufs_wr(SD_INTSTS, 0xffffffff);
++	ufs_wr(SD_ARG, arg);
++	ufs_wr(SD_XFER, (idx << 24) | (flags << 16) | mode);
++	uint32_t st = emmc_wait_int(INT_CMD_DONE, deadline);
++	if (st == 0 || (st & INT_ERROR)) {
++		printf("SWEET EMMC: CMD%u arg 0x%x failed: int 0x%x\n", idx, arg, st);
++		emmc_reset_lines();
++		return st ? EIO : ETIMEDOUT;
++	}
++	*r1 = ufs_rd(SD_RESP0);
++	ufs_wr(SD_INTSTS, INT_CMD_DONE);
++	if (*r1 & R1_ERRORS) {
++		printf("SWEET EMMC: CMD%u arg 0x%x: card status 0x%x\n", idx, arg, *r1);
++		emmc_reset_lines();
++		return EIO;
++	}
++	return 0;
++}
++
++/*
++ * One data command (CMD8/17/18/24/25) of count 512-byte blocks to/from the
++ * bounce buffer. Multi-block transfers stop with auto CMD12.
++ */
++static int
++emmc_data(uint32_t idx, uint32_t arg, uint32_t count, bool write)
++{
++	uint32_t *buf = (uint32_t *)(su.dma + DMA_BOUNCE);
++	uint32_t mode = XFER_BLKCNT | (write ? 0 : XFER_READ) | (count > 1 ? XFER_MULTI | XFER_ACMD12 : 0);
++	uint32_t r1, st = 0;
++
++	if (count == 0 || count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	ufs_wr(SD_BLKSIZE, (count << 16) | (7u << 12) | UFS_BLOCK);
++	int error = emmc_cmd(idx, arg, CMD_R1 | CMD_DATA, mode, &r1);
++	if (error) {
++		return error;
++	}
++	uint64_t deadline = emmc_deadline(CMD_TIMEOUT_NS);
++	uint32_t ready = write ? PSTATE_BUF_WR : PSTATE_BUF_RD;
++	for (uint32_t b = 0; b < count; b++) {
++		while (!(ufs_rd(SD_PSTATE) & ready)) {
++			st = ufs_rd(SD_INTSTS);
++			if ((st & INT_ERROR) || mach_absolute_time() > deadline) {
++				goto fail;
++			}
++		}
++		uint32_t *p = buf + b * (UFS_BLOCK / 4);
++		if (write) {
++			for (uint32_t i = 0; i < UFS_BLOCK / 4; i++) {
++				ufs_wr(SD_BUFFER, p[i]);
++			}
++		} else {
++			for (uint32_t i = 0; i < UFS_BLOCK / 4; i++) {
++				p[i] = ufs_rd(SD_BUFFER);
++			}
++		}
++	}
++	/* For writes this includes the card's busy (programming) phase. */
++	st = emmc_wait_int(INT_XFER_DONE, deadline);
++	if (st == 0 || (st & INT_ERROR)) {
++		goto fail;
++	}
++	ufs_wr(SD_INTSTS, 0xffffffff);
++	return 0;
++fail:
++	printf("SWEET EMMC: CMD%u arg 0x%x count %u failed: int 0x%x acmd 0x%x pstate 0x%x\n",
++	    idx, arg, count, st, ufs_rd(SD_ACMDERR) & 0xffff, ufs_rd(SD_PSTATE));
++	emmc_reset_lines();
++	return (st & INT_ERROR) ? EIO : ETIMEDOUT;
++}
++
++static int
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	if (lba > UINT32_MAX) {
++		return EINVAL;
++	}
++	return emmc_data(count > 1 ? 18 : 17, (uint32_t)lba, count, false);
++}
++#endif /* SWEET_MARIE */
++
+ /*
+  * topaz: on 2026-10-19 the LUN0 GPT (super, userdata, esp, win, ...) was found
+  * destroyed after iOS sessions. Remember both GPT copies and fence them off;
+@@ -290,23 +479,50 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+ 	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX ||
+-	    lba < 6 || (gpt_alt && lba + count - 1 >= gpt_alt - 4)) {
++	    lba < (UFS_BLOCK == 512 ? 34 : 6) ||
++	    (gpt_alt && lba + count - 1 >= gpt_alt - (UFS_BLOCK == 512 ? 33 : 4))) {
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++#if SWEET_MARIE
++	return emmc_data(count > 1 ? 25 : 24, (uint32_t)lba, count, true);
++#else
+ 	uint8_t cdb[10] = {
+ 		0x2a, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+ 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+ 	};
+ 	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++#endif
+ }
+ 
+ static int
+ ufs_sync_cache(void)
+ {
++#if SWEET_MARIE
++	/* CMD6 SWITCH: write EXT_CSD FLUSH_CACHE[32] = 1 (R1b: waits for the busy end) */
++	uint32_t r1;
++	if (!su.emmc_cache) {
++		return 0;
++	}
++	int error = emmc_cmd(6, (3u << 24) | (32u << 16) | (1u << 8), CMD_R1B, 0, &r1);
++	if (!error) {
++		uint32_t st = emmc_wait_int(INT_XFER_DONE, emmc_deadline(CMD_TIMEOUT_NS));
++		ufs_wr(SD_INTSTS, 0xffffffff);
++		if (st == 0 || (st & INT_ERROR)) {
++			printf("SWEET EMMC: cache flush busy wait failed: int 0x%x\n", st);
++			emmc_reset_lines();
++			error = EIO;
++		}
++	}
++	if (!error) {
++		error = emmc_cmd(13, EMMC_RCA << 16, CMD_R1, 0, &r1);
++	}
++	return error;
++#else
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
++#endif
+ }
+ 
+ static int
+@@ -392,7 +608,7 @@ ufs_lookup_part(const char *want, unsigned *slot)
+ 	if (part_cached == sizeof(part_cache) / sizeof(part_cache[0]) || strlen(want) > 36) {
+ 		return ENOSPC;
+ 	}
+-	for (uint8_t lun = 0; lun < 6; lun++) {
++	for (uint8_t lun = 0; lun < UFS_LUNS; lun++) {
+ 		su.lun = lun;
+ 		if (ufs_read_blocks(1, 1) != 0 || memcmp(b, "EFI PART", 8) != 0) {
+ 			continue;
+@@ -472,6 +688,40 @@ sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len)
+ 	return error;
+ }
+ 
++#if SWEET_MARIE
++static int
++ufs_take_over_host(void)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint32_t r1;
++
++	/* Polled: latch every status bit, signal none. */
++	ufs_wr(SD_SIGEN, 0);
++	ufs_wr(SD_INTEN, 0xffff7fffu);
++	ufs_wr(SD_INTSTS, 0xffffffff);
++	int error = emmc_cmd(13, EMMC_RCA << 16, CMD_R1, 0, &r1);
++	if (error || EMMC_STATE(r1) != EMMC_TRAN) {
++		printf("SWEET EMMC: card not in transfer state (error %d, status 0x%x)\n", error, r1);
++		return error ? error : ENXIO;
++	}
++	error = emmc_data(8, 0, 1, false);              /* SEND_EXT_CSD */
++	if (error) {
++		return error;
++	}
++	/* Only the plain user area without command queueing is supported here. */
++	if (b[15] || (b[179] & 7)) {
++		printf("SWEET EMMC: unsupported card setup: CMDQ_MODE_EN %u PARTITION_CONFIG 0x%x\n",
++		    b[15], b[179]);
++		return ENXIO;
++	}
++	su.emmc_cache = (b[33] & 1) != 0;
++	uint32_t sectors;
++	memcpy(&sectors, b + 212, 4);
++	printf("SWEET EMMC: card ready: HS_TIMING %u, %u MiB, cache %s\n",
++	    b[185], sectors >> 11, su.emmc_cache ? "on" : "off");
++	return 0;
++}
++#else
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -505,6 +755,7 @@ ufs_take_over_host(void)
+ 	}
+ 	return 0;
+ }
++#endif /* SWEET_MARIE */
+ 
+ static int
+ sweet_ufs_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
+@@ -603,7 +854,8 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		if (is_char) {
+ 			return ENODEV;
+ 		}
+-		if (*f < DEV_BSIZE || *f > UFS_BLOCK || (*f & (*f - 1))) {
++		/* marie: 512-byte device blocks, but HFS may want up to 4 KiB logical blocks */
++		if (*f < DEV_BSIZE || *f > MAX(UFS_BLOCK, 4096u) || (*f & (*f - 1))) {
+ 			return EINVAL;
+ 		}
+ 		su.secsize = *f;
+@@ -776,12 +1028,14 @@ sweet_ufs_init(void)
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
++#if !SWEET_MARIE
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 	}
++#endif
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}

@@ -61,6 +61,8 @@ MARIE_ECID = 0x4d41524945000001  # 'MARIE' + 1, synthetic
 # shim/start.S has a trampoline + mailbox there. Placeholders: shim/loader.c
 # writes the real addresses into every CPU's property at boot.
 MARIE_PSCI_TRAMP, MARIE_PSCI_MAILBOX = 0, 0
+# eMMC host: SDHCI registers of sdhci@FF3E1000 (0xFF3E1000 itself is the PHY)
+MARIE_EMMC, MARIE_EMMC_SIZE = 0xff3e6000, 0x1000
 # --marie --qemu: QEMU virt,gic-version=2 (tools/qemu-sweet.py --gic 2), with
 # the topaz QEMU RAM layout and framebuffer
 QEMU_GICV2_GICD, QEMU_GICV2_GICC = 0x08000000, 0x08010000
@@ -250,6 +252,13 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, mari
         ('compatible', cstr('qcom,ufshc')),
         ('reg', u64(UFS, UFS_SIZE)),
     ])
+    if marie:
+        # xnu 0205: same driver, SDHCI eMMC backend (kirin710_mmc.dtsi reg[0] "HCI standard")
+        ufs = node('sweet-ufs', [
+            ph(),
+            ('compatible', cstr('mshc,sdhci')),
+            ('reg', u64(MARIE_EMMC, MARIE_EMMC_SIZE)),
+        ])
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -284,7 +293,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, mari
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu or marie else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
