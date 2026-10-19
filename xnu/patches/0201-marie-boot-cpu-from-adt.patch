@@ -1,0 +1,28 @@
+marie: boot CPU is the ADT's first CPU, not a fixed MPIDR 0x100
+
+The phone still boots on A73 0x100; QEMU virt (tools/qemu-sweet.py) boots
+on MPIDR 0, which topaz 0082 rejected.
+
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index fa36e0f..af96947 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -148,12 +148,13 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		IOSleep(1);
+ 	}
+ 	/*
+-	 * topaz: the ADT lists only the A73 (gold) cores and the shim boots xnu
+-	 * on gold CPU 0x100 (the silver cluster has no 16K granule).
++	 * topaz/marie: the ADT lists only the A73 (gold) cores and the shim boots
++	 * xnu on gold CPU 0x100 (the silver cluster has no 16K granule). The ADT's
++	 * first CPU is the boot CPU (MPIDR 0 under QEMU virt).
+ 	 */
+-	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0x100) {
+-		panic("SWEET CPU: expected boot MPIDR 0x100 and logical CPU 0, got 0x%x/%u",
+-		    topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
++	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != topology->cpus[0].phys_id) {
++		panic("SWEET CPU: expected boot MPIDR 0x%x and logical CPU 0, got 0x%x/%u",
++		    topology->cpus[0].phys_id, topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
+ 	}
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);

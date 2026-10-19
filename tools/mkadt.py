@@ -60,6 +60,7 @@ MARIE_ECID = 0x4d41524945000001  # 'MARIE' + 1, synthetic
 # --marie --qemu: QEMU virt,gic-version=2 (tools/qemu-sweet.py --gic 2), with
 # the topaz QEMU RAM layout and framebuffer
 QEMU_GICV2_GICD, QEMU_GICV2_GICC = 0x08000000, 0x08010000
+QEMU_GICV2_FB = 0x9c000000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
 
@@ -107,6 +108,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False, mari
     board = 'marie' if marie else 'topaz'
     fb, fb_size, fb_w, fb_h, fb_stride = ((MARIE_FB, MARIE_FB_SIZE, MARIE_FB_W, MARIE_FB_H, MARIE_FB_STRIDE)
                                           if marie and not qemu else (FB, FB_SIZE, FB_W, FB_H, FB_STRIDE))
+    if marie and qemu:
+        fb = QEMU_GICV2_FB	# where qemu-sweet.py reads the screen
     marie_gicd, marie_gicc = (QEMU_GICV2_GICD, QEMU_GICV2_GICC) if qemu else (MARIE_GICD, MARIE_GICC)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
