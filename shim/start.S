@@ -16,6 +16,22 @@ _head:
 	.ascii	"ARM\x64"		/* magic */
 	.long	0			/* res5 (PE offset) */
 
+/*
+ * marie: Huawei's PSCI rejects CPU_ON entry points in xnu's RAM window
+ * (rc -9). xnu (SweetCPU, ADT "sweet,psci-trampoline") stores its real
+ * secondary entry in the mailbox and points CPU_ON here instead; this image
+ * stays at its load address (0x80000) below xnu's RAM. MMU off, x0 = context.
+ */
+	.section .text.tramp, "ax"
+	.globl xnu_psci_tramp
+xnu_psci_tramp:
+	ldr	x1, xnu_psci_mailbox
+	br	x1
+	.balign	8
+	.globl xnu_psci_mailbox
+xnu_psci_mailbox:
+	.quad	0
+
 	.text
 	.globl _start
 _start:

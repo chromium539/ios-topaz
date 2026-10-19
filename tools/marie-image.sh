@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build a flashable marie kernel-partition image from an xnu kernel.
-#   tools/marie-image.sh KERNEL NAME [--ramdisk IMAGE] [--qemu] [--args "extra boot-args"]
+#   [CPUS=n] tools/marie-image.sh KERNEL NAME [--ramdisk IMAGE] [--qemu] [--args "extra boot-args"]
 # -> shim/out/marie-NAME.img (fastboot flash kernel ...); with --qemu also
 #    boots the payload in QEMU virt,gic-version=2 into research/q-NAME/.
 set -euo pipefail
@@ -18,7 +18,7 @@ while [ $# -gt 0 ]; do
 done
 # Topaz drivers that touch Qualcomm hardware stay off: no UFS root, no fuel
 # gauge (Qualcomm I2C) and no cpufreq (Qualcomm LUT) on the Kirin 710.
-args="debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress sweetbattery=0 sweetcpufreq=0 wdt=-1 wdt_test=no_user_checkin"
+args="debug=0xc serial=3 cpus=${CPUS:-1} keepsyms=1 -noprogress sweetbattery=0 sweetcpufreq=0 wdt=-1 wdt_test=no_user_checkin"
 rdarg=()
 if [ -n "$ramdisk" ]; then
 	args="$args rd=md0"

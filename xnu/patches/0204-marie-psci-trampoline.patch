@@ -1,0 +1,46 @@
+marie: secondary CPUs through the shim's low-memory PSCI trampoline
+
+cpus=4 on the phone: PSCI CPU_ON rc=-9 (INVALID_ADDRESS) for the
+secondary entry at 0x414b8000; Huawei firmware accepts entries in low
+memory only (the shim's own CPU_ON at ~0x80848 works). With the ADT CPU
+property sweet,psci-trampoline = <tramp PA, mailbox PA>, SweetCPU writes
+the real entry into the mailbox and starts the CPU at the trampoline.
+
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index af96947..b8d226f 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -19,6 +19,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #if SWEET_GICV2
+ extern "C" void sweet_gic_send_sgi(unsigned int cpu, uint64_t mpidr, unsigned int sgi);
+ #endif
+@@ -255,6 +256,25 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
+ 	IOLog("SWEET CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
++	/*
++	 * marie: Huawei's PSCI rejects entry points in the kernel's RAM window
++	 * (CPU_ON rc=-9 INVALID_ADDRESS for 0x414b8000). The shim keeps a
++	 * trampoline in low memory it was loaded to: <trampoline PA, mailbox PA>.
++	 * The new CPU loads the mailbox and branches to it, x0 untouched.
++	 */
++	OSData *tramp = OSDynamicCast(OSData, getProvider()->getProperty("sweet,psci-trampoline"));
++	if (tramp != NULL && tramp->getLength() == 2 * sizeof(uint64_t)) {
++		const uint64_t *t = (const uint64_t *)tramp->getBytesNoCopy();
++		vm_offset_t page = t[1] & ~(vm_offset_t)PAGE_MASK;
++		vm_offset_t va = ml_io_map(page, PAGE_SIZE);
++		if (va == 0) {
++			panic("SWEET CPU: cannot map PSCI mailbox 0x%llx", t[1]);
++		}
++		*(volatile uint64_t *)(va + (t[1] - page)) = entry;
++		IOLog("SWEET CPU: cpu=%u via trampoline 0x%llx (mailbox 0x%llx)\n",
++		    getCPUNumber(), t[0], t[1]);
++		entry = (vm_offset_t)t[0];
++	}
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);

@@ -68,6 +68,7 @@ static inline uint8_t rd8(uintptr_t a) { return *(volatile uint8_t *)a; }
 static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 
 extern char secondary_entry[];
+extern char xnu_psci_tramp[], xnu_psci_mailbox[];
 
 /*
  * Reads of powered-down/clock-gated blocks (e.g. idle DSS read channels)
@@ -414,6 +415,10 @@ static void __attribute__((noreturn)) gold_main(void)
 	cpu_report("A73");
 	if (payload_present()) {
 		con_skip();
+		/* mkadt.py --marie hard-codes these for xnu's secondary CPUs */
+		con_hex2("TRAMP", "pa=", (uintptr_t)xnu_psci_tramp, "mbox=", (uintptr_t)xnu_psci_mailbox);
+		if ((uintptr_t)xnu_psci_tramp != 0x80400 || (uintptr_t)xnu_psci_mailbox != 0x80408)
+			con_str("TRAMP", "NOT at 0x80400/0x80408: cpus>1 will fail");
 		stage = "loader";
 		con_str("LOADER", loader_boot(gold_dtb));
 		halt();
