@@ -46,6 +46,13 @@ All gates passed:
 - **GIC-400:** GICD_TYPER `0xFCEB` (384 IRQs, 8 CPU interfaces, SecurityExtn). The CPU interface on A73 0x100 is **#4**. GICD/GICC are already enabled for Group 1 with PMR `0xF0`. vtimer PPI 27, ptimer PPI 30 and SGI 1 are delivered as NS Group 1 IRQs (30/30/10 in 300 ms).
 - **Watchdog:** after disabling the SP805, 300 s idle with no reset.
 
+## Phase 3 milestone: iOS home screen on the phone (2026-10-19)
+- **Kernel:** xnu 0207 (CI 39305111981, `xnu/out-0207`), image `shim/out/marie-0207-gui.img`. Built with `CPUS=4 MARIE_DISPLAY=1 tools/marie-image.sh ... --args "rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 sweetfb_hz=30 sweetfb_noconsole=1"`.
+- **Display:** AppleCLCD copy path (xnu 0206) into the fastboot logo buffer; iPhone X canvas 1125x2436 cropped to the 1080x2312 panel.
+- **First GUI boot:** Apple logo for well over 10 minutes (console on, then off) before SpringBoard appeared. The first boot builds the LaunchServices database. Likely slow because of polled eMMC PIO and the A73s at fastboot's clock (no cpufreq).
+- **Debugging without a screen:** `tools/marie-log-pull.py` reads the persistent console log (last 8193 sectors of userdata) over the ../marie busybox USB-serial image (not needed this time).
+- **Not working yet:** touch (Novatek NT36682A TDDI over SPI), buttons, brightness, CPU frequency, eMMC DMA, Wi-Fi and the rest.
+
 ## Phase 2/3 milestone: iOS 16.7.16 userland on the phone (2026-10-19, photo IMG_1924)
 - **Root:** `research/ios16-root.img` (`tools/marie-mkroot.sh`: 16 GB journaled HFS+, topaz root tweaks), flashed with `fastboot flash userdata research/ios16-root.img.simg` (27 sparse chunks, 7 min; Huawei fastboot allows it and erases the Android crypt info in oeminfo).
 - **Kernel:** xnu 0205 (CI 39300558240), `CPUS=4 tools/marie-image.sh xnu/out-0205/kernel.development.sweet 0205-ios-rw --args "rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1"`.
