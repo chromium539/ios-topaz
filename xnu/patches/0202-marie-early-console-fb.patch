@@ -1,0 +1,108 @@
+marie: bootstrap console on the Huawei fastboot logo buffer
+
+The sweet/topaz early console (start.s stage 0 band, VA=PA block,
+sweet_early.c, the arm_vm_init alias) was hard-coded to 0x9c000000
+1080x2400. On marie that is RAM inside the kernel window: nothing early
+was visible. SWEET.h now names the address once; marie uses 0x18c00000
+(1080x2312), which is not 32MB aligned, and maps its block as Device
+memory because the block also covers a no-map carve-out.
+
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..d4318c8 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,9 +1843,9 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = (uint64_t)SWEET_EARLY_FB_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++	    ARM_TTE_BLOCK_ATTRINDX(SWEET_EARLY_FB_ATTRINDX) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+@@ -2190,7 +2190,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ #if defined(SWEET)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+-	sweet_early_relocate(SWEET_EARLY_FB_VA);
++	sweet_early_relocate(SWEET_EARLY_FB_VA + (SWEET_EARLY_FB_PA - SWEET_EARLY_FB_BLOCK_PA));
+ #endif
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..cece8b3 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -515,7 +515,7 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (SWEET_EARLY_FB_PA + (SWEET_EARLY_FB_HEIGHT - 32) * SWEET_EARLY_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+ 	mov		x4, #4320
+@@ -686,8 +686,8 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
+-	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	MOV64	x10, SWEET_EARLY_FB_BLOCK_PA
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(SWEET_EARLY_FB_ATTRINDX) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..5e058f6 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,11 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_PA;
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_HEIGHT ((unsigned int)SWEET_EARLY_FB_HEIGHT)
++#define EARLY_STRIDE (SWEET_EARLY_FB_STRIDE / 4u)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 28ee8eb..2d18a1e 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -44,6 +44,26 @@
+  * everything xnu uses is a non-secure Group 1 IRQ (see pe_fiq.c).
+  */
+ #define SWEET_GICV2               1
++#define SWEET_MARIE               1
++
++/*
++ * Bootstrap console (osfmk/arm64/sweet_early.c, start.s): the framebuffer the
++ * bootloader leaves scanning out, mapped VA=PA as one 32MB L2 block, later
++ * at SWEET_EARLY_FB_VA. marie: Huawei fastboot's logo buffer (DSS read
++ * channel D2, 1080x2312). Its block also covers the no-map carve-out below
++ * it, so marie maps the block as Device memory (never read speculatively).
++ */
++#if SWEET_MARIE
++#define SWEET_EARLY_FB_PA         0x18c00000
++#define SWEET_EARLY_FB_HEIGHT     2312
++#define SWEET_EARLY_FB_ATTRINDX   CACHE_ATTRINDX_DISABLE
++#else
++#define SWEET_EARLY_FB_PA         0x9c000000
++#define SWEET_EARLY_FB_HEIGHT     2400
++#define SWEET_EARLY_FB_ATTRINDX   CACHE_ATTRINDX_WRITECOMB
++#endif
++#define SWEET_EARLY_FB_BLOCK_PA   (SWEET_EARLY_FB_PA & ~0x1ffffff)
++#define SWEET_EARLY_FB_STRIDE     4320
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
