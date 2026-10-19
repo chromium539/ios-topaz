@@ -96,6 +96,7 @@ static const char *stage;	/* set at runtime: no absolute pointers in data */
 static volatile uint32_t irq_count, irq_other, irq_last;
 static volatile int irq_src;
 static volatile int gold_up, gold_go;
+static volatile uint32_t a53_mhz;
 static volatile uint64_t sib_mpidr[8];	/* CPU_ON test: woken A73 siblings */
 static volatile uint64_t gold_dtb;
 
@@ -200,6 +201,29 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	con_hex("X1", regs[1]);
 	con_hex("X30", regs[29]);	/* stashed lr is just above the frame */
 	halt();
+}
+
+/* ---- CPU clock estimate ---- */
+
+/*
+ * 20M dependent adds with the I-cache on (fine with the MMU off), timed
+ * against the system counter: about one add per cycle on A53 and A73, so
+ * MHz ~= iterations / microseconds. Rough, but enough to see whether the
+ * A73s run at fastboot's boot clock or near their 2.2 GHz maximum.
+ */
+static uint32_t cpu_mhz(void)
+{
+	uint64_t sctlr = rsr("sctlr_el1");
+	wsr("sctlr_el1", sctlr | (1UL << 12));
+	isb();
+	uint64_t t = now(), x = 0;
+	for (uint64_t i = 0; i < 20000000; i++)
+		__asm__ volatile("add %0, %0, #1" : "+r"(x));
+	t = now() - t;
+	wsr("sctlr_el1", sctlr);
+	isb();
+	uint64_t us = t * 1000000 / rsr("cntfrq_el0");
+	return us ? (uint32_t)(20000000 / us) : 0;
 }
 
 /* ---- watchdog ---- */
@@ -409,6 +433,7 @@ static void __attribute__((noreturn)) gold_main(void)
 		;
 	con_skip();
 	cpu_report("A73");
+	con_hex2(" mhz", "a73~", cpu_mhz(), "a53~", a53_mhz);
 	if (payload_present()) {
 		con_skip();
 		/* loader.c writes these into the ADT for xnu's secondary CPUs */
@@ -509,6 +534,7 @@ void shim_main(uint64_t dtb)
 	stage = "psci";
 	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
 	cpu_report("A53");
+	a53_mhz = cpu_mhz();
 
 	stage = "dcache";
 	dcache_cisw_all();
