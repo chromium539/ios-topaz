@@ -1,0 +1,144 @@
+marie: Qualcomm-only drivers off at compile time (touch, keys, cpufreq, I2C1, USB, modem)
+
+Their TLMM/GCC/SPMI/QUP/DWC3/cpufreq-hw addresses are plain low DRAM on
+the Kirin 710. The first eMMC-root boot showed sweet_keys probing SPMI
+and sweet_touch scheduling itself (they start with the root device);
+boot-args (sweettouch=0 ...) are no longer the only thing in the way.
+SweetBattery falls back to its static source (sweet_i2c1_init fails).
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 94c7552..3b34798 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -7,6 +7,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <pexpert/arm64/board_config.h>   /* SWEET_MARIE */
+ #include <machine/machine_routines.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -22,7 +23,12 @@ int
+ sweet_cpufreq_max(void)
+ {
+ 	int on = 1;
++#if SWEET_MARIE
++	/* marie (Kirin 710): this is Qualcomm hardware; its addresses are plain DRAM there */
++	on = 0;
++#else
+ 	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
++#endif
+ 	if (!on) {
+ 		return 0;
+ 	}
+diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
+index 08cdc34..a47ee50 100644
+--- a/bsd/dev/sweet_i2c1.c
++++ b/bsd/dev/sweet_i2c1.c
+@@ -7,6 +7,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <pexpert/arm64/board_config.h>   /* SWEET_MARIE */
+ #include <sys/errno.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+@@ -177,6 +178,10 @@ sweet_i2c1_init(void)
+ 	if (i2c1_ready) {
+ 		return 0;
+ 	}
++#if SWEET_MARIE
++	/* marie (Kirin 710): this is Qualcomm hardware; its addresses are plain DRAM there */
++	return ENXIO;
++#endif
+ 	i2c1_gcc = ml_io_map(I2C1_GCC_PA, 0x80000);
+ 	i2c1_west = ml_io_map(I2C1_WEST_PA, 0x6000);
+ 	i2c1_se = ml_io_map(I2C1_SE_PA, 0x4000);
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 65970f9..18b2237 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -12,6 +12,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>   /* SWEET_MARIE */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -132,6 +133,11 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_started = true;
++#if SWEET_MARIE
++	/* marie (Kirin 710): this is Qualcomm hardware; its addresses are plain DRAM there */
++	printf("%s: not on marie\n", "SWEET KEYS");
++	return;
++#endif
+ 	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index ff9d858..154ebbd 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -16,6 +16,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>   /* SWEET_MARIE */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -745,6 +746,11 @@ sweet_touch_init(void)
+ 		return;
+ 	}
+ 	st.started = true;
++#if SWEET_MARIE
++	/* marie (Kirin 710): this is Qualcomm hardware; its addresses are plain DRAM there */
++	printf("%s: not on marie\n", "SWEET TOUCH");
++	return;
++#endif
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	st.irq_hint = 1; /* topaz: read on IRQ GPIO80 low, while touching, else every 100 ms */
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9c42e45..86da85a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -13,6 +13,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <pexpert/arm64/board_config.h>   /* SWEET_MARIE */
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -77,6 +78,12 @@ sweet_usb_probe(void)
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
++#if SWEET_MARIE
++	/* marie (Kirin 710): this is Qualcomm hardware; its addresses are plain DRAM there */
++	printf("SWEET USB: not on marie\n");
++	return;
++#endif
++
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index e18599a..e85ffa6 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3352,6 +3352,10 @@ topaz_modem_init(void)
+ 	uint32_t on = 0;
+ 	thread_t thread;
+ 
++#if SWEET_MARIE
++	/* marie (Kirin 710): this is Qualcomm hardware; its addresses are plain DRAM there */
++	return;
++#endif
+ 	if (started || !PE_parse_boot_argn("modem", &on, sizeof(on)) || on == 0) {
+ 		return;
+ 	}
