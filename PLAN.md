@@ -46,6 +46,17 @@ All gates passed:
 - **GIC-400:** GICD_TYPER `0xFCEB` (384 IRQs, 8 CPU interfaces, SecurityExtn). The CPU interface on A73 0x100 is **#4**. GICD/GICC are already enabled for Group 1 with PMR `0xF0`. vtimer PPI 27, ptimer PPI 30 and SGI 1 are delivered as NS Group 1 IRQs (30/30/10 in 300 ms).
 - **Watchdog:** after disabling the SP805, 300 s idle with no reset.
 
+## Phase 1 milestone: XNU to PID 1 on the phone (2026-10-19, photos IMG_1910/1911)
+Kernel xnu 0201+0202+0203 (CI run 39294487743, `xnu/out-0203`), image `shim/out/marie-0203c.img`. Boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress sweetbattery=0 sweetcpufreq=0 wdt=-1 wdt_test=no_user_checkin rd=md0`. ADT: `mkadt.py --marie`. RAM disk: `research/init/sweet-init` (mockfs root).
+Result: A73 0x100 alive, SGI1 verified through the GICv2 backend, `BSD root: md0`, `*** SWEET userspace: init running as PID 1 ***` and 5 s heartbeats.
+What it took:
+- **0200** GICv2 backend
+- **0201** boot CPU taken from the ADT
+- **0202** early console on `0x18C00000`: topaz's was hard-wired to `0x9C000000`, which on marie is RAM inside the kernel window
+- **0203** SPAN set: QEMU only
+- **shim:** clean+invalidate the A53's D-caches by set/way before CPU_ON. Without it XNU hung right after `start_first_cpu` (stage 0 band only): dirty fastboot lines on the A53.
+QEMU (`tools/marie-image.sh ... --qemu`, GICv2) reaches the same point, except that the early console is not visible there.
+
 ## Phase 0: Bare-metal probes (shim only, no XNU)
 Fork ios-topaz into this directory and add a `marie` branch. Adapt `shim/` (`start.S`, `shim.c`, `loader.c`, `mmu.c`, `console.c`, `build.sh`):
 1. **Boot format:** keep a Linux arm64 Image header and pack it as **boot v1** with kernel at `0x80000`. Put the payload after `_end`, as topaz already does. First test whether Huawei fastboot accepts `fastboot boot` with the stock `clean/kernel_boot.img`. If it does, use RAM boots for every iteration; if not, flash to `kernel`.
