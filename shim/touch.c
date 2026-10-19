@@ -326,47 +326,53 @@ static void __attribute__((noreturn)) touch_loop(void)
 	}
 }
 
-void test_touch(void)
+/*
+ * SPI1 clocks and pins, CS GPIO, PL022 in mode 0 (SSPCLK / 160), touch reset
+ * released, bootloader reset. verbose: report the registers on the way.
+ * 0, or -1 if the PL022 does not answer.
+ */
+static int touch_setup(int verbose)
 {
 	uint32_t g0 = peek(PERI_CRG + PERSTAT2);
 
-	/* --- clocks --- */
 	wr(PERI_CRG + PEREN2, SPI1_GATE);
 	wr(PERI_CRG + CLKGT_SPI, (1u << (13 + 16)) | (1u << 13));
-	con_hex2("CRG", "stat2 was=", g0, "now=", peek(PERI_CRG + PERSTAT2));
-	con_hex2(" crg", "rst2=", peek(PERI_CRG + PERRSTSTAT2), "gt=", peek(PERI_CRG + CLKGT_SPI));
-	con_hex2(" crg", "div=", peek(PERI_CRG + CLKDIV_SPI), "mux=", peek(PERI_CRG + CLKMUX_SPI));
-
-	/* --- pins --- */
-	con_hex2("IOMG", "spi7=", peek(IOMG_SPI1), "irq210=", peek(IOMG_TP_IRQ));
-	con_hex2(" iocg", "spi7=", peek(IOCG_SPI1), "spi8=", peek(IOCG_SPI1 + 4));
+	if (verbose) {
+		con_hex2("CRG", "stat2 was=", g0, "now=", peek(PERI_CRG + PERSTAT2));
+		con_hex2(" crg", "rst2=", peek(PERI_CRG + PERRSTSTAT2), "gt=", peek(PERI_CRG + CLKGT_SPI));
+		con_hex2(" crg", "div=", peek(PERI_CRG + CLKDIV_SPI), "mux=", peek(PERI_CRG + CLKMUX_SPI));
+		con_hex2("IOMG", "spi7=", peek(IOMG_SPI1), "irq210=", peek(IOMG_TP_IRQ));
+		con_hex2(" iocg", "spi7=", peek(IOCG_SPI1), "spi8=", peek(IOCG_SPI1 + 4));
+	}
 	for (int i = 0; i < 3; i++)
 		wr(IOMG_SPI1 + 4 * i, 1);
-	con_hex2(" iomg", "spi now=", peek(IOMG_SPI1), "spi9=", peek(IOMG_SPI1 + 8));
-
-	/* --- GPIOs: CS output high; IRQ and reset only reported --- */
-	con_hex2("GPIO", "csdir=", peek(GPIO_CS + GPIODIR), "irq=", peek(GPIO_BIT(GPIO_IRQ, 2)));
-	con_hex2(" gpio", "rstdir=", peek(GPIO_RST + GPIODIR), "rst=", peek(GPIO_BIT(GPIO_RST, 0)));
+	if (verbose) {
+		con_hex2("GPIO", "csdir=", peek(GPIO_CS + GPIODIR), "irq=", peek(GPIO_BIT(GPIO_IRQ, 2)));
+		con_hex2(" gpio", "rstdir=", peek(GPIO_RST + GPIODIR), "rst=", peek(GPIO_BIT(GPIO_RST, 0)));
+	}
 	cs(1);
 	wr(GPIO_CS + GPIODIR, rd(GPIO_CS + GPIODIR) | (1u << 2));
-
-	/* --- PL022 --- */
-	con_hex2("PL022", "pid0=", peek(SPI1 + SSPPID0), "cr0=", peek(SPI1 + SSPCR0));
-	con_hex2(" pl022", "cr1=", peek(SPI1 + SSPCR1), "sr=", peek(SPI1 + SSPSR));
+	if (verbose)
+		con_hex2("PL022", "pid0=", peek(SPI1 + SSPPID0), "sr=", peek(SPI1 + SSPSR));
 	if (peek(SPI1 + SSPPID0) == 0xdeadbeef) {
 		con_str("PL022", "abort: still unclocked or in reset");
-		return;
+		return -1;
 	}
-
-	/* --- release the touch reset (nvt_kit_hw_reset on SPI: high, 5 ms) --- */
+	/* release the touch reset (nvt_kit_hw_reset on SPI: high, 5 ms) */
 	wr(GPIO_BIT(GPIO_RST, 0), 0xff);
 	wr(GPIO_RST + GPIODIR, rd(GPIO_RST + GPIODIR) | 1u);
 	udelay(20000);
-	con_hex2("RST", "now=", peek(GPIO_BIT(GPIO_RST, 0)), "irq=", peek(GPIO_BIT(GPIO_IRQ, 2)));
-
 	spi_config(0, 16, 9);		/* mode 0 (milestone 4 sweep), SSPCLK / 160 */
 	nvt_write(SWRST_N8, 0x69);	/* bootloader reset */
 	udelay(15000);
+	return 0;
+}
+
+/* Probe mode (no xnu payload): registers, chip ID, firmware, then draw touches. */
+void test_touch(void)
+{
+	if (touch_setup(1))
+		return;
 	read_id("ID");			/* dd 0A 00 00 / 82 66 03 00 */
 	if ((uintptr_t)nvt_fw_end == (uintptr_t)nvt_fw) {
 		con_str("FW", "not embedded (research/touch/ missing at build)");
@@ -379,4 +385,20 @@ void test_touch(void)
 	con_str("TOUCH", "firmware running: touch the screen");
 	con_skip();
 	touch_loop();
+}
+
+/*
+ * Before xnu (loader path): bring the touch controller up with its firmware;
+ * xnu (0208) then only reads the event buffer. Failure leaves touch off.
+ */
+void touch_prepare(void)
+{
+	if ((uintptr_t)nvt_fw_end == (uintptr_t)nvt_fw) {
+		con_str("TOUCH", "no firmware embedded: touch off");
+		return;
+	}
+	if (touch_setup(0))
+		return;
+	int st = fw_download();
+	con_hex2("TOUCH", "fw state=", (uint32_t)st, "want>=", 0xa0);
 }

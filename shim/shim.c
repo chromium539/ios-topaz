@@ -413,6 +413,8 @@ static void __attribute__((noreturn)) gold_main(void)
 		con_skip();
 		/* loader.c writes these into the ADT for xnu's secondary CPUs */
 		con_hex2("TRAMP", "pa=", (uintptr_t)xnu_psci_tramp, "mbox=", (uintptr_t)xnu_psci_mailbox);
+		stage = "touch";
+		touch_prepare();
 		stage = "loader";
 		con_str("LOADER", loader_boot(gold_dtb));
 		halt();
