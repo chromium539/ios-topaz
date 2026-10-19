@@ -46,6 +46,13 @@ All gates passed:
 - **GIC-400:** GICD_TYPER `0xFCEB` (384 IRQs, 8 CPU interfaces, SecurityExtn). The CPU interface on A73 0x100 is **#4**. GICD/GICC are already enabled for Group 1 with PMR `0xF0`. vtimer PPI 27, ptimer PPI 30 and SGI 1 are delivered as NS Group 1 IRQs (30/30/10 in 300 ms).
 - **Watchdog:** after disabling the SP805, 300 s idle with no reset.
 
+## Phase 2/3 milestone: iOS 16.7.16 userland on the phone (2026-10-19, photo IMG_1924)
+- **Root:** `research/ios16-root.img` (`tools/marie-mkroot.sh`: 16 GB journaled HFS+, topaz root tweaks), flashed with `fastboot flash userdata research/ios16-root.img.simg` (27 sparse chunks, 7 min; Huawei fastboot allows it and erases the Android crypt info in oeminfo).
+- **Kernel:** xnu 0205 (CI 39300558240), `CPUS=4 tools/marie-image.sh xnu/out-0205/kernel.development.sweet 0205-ios-rw --args "rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1"`.
+- **Read-only first:** a read-only mount fails because the fresh journal needs one write to initialise (`jnl: write_journal_header` EROFS), so the first boot has to be read-write.
+- **Result:** launchd, xpcproxy, bluetoothd, medialibraryd, fairplayd and backboardd run. SpringBoard crash-loops with `failed to find the main CADisplay` (no display node), so the display (xnu 0206 + `MARIE_DISPLAY=1`) is next.
+- **Topaz touch/keys:** `sweet_ufs.c` starts topaz's touch/keys drivers with the root device. Their Qualcomm addresses are low DRAM on the Kirin, so `marie-image.sh` passes `sweettouch=0 sweetkeys=0`.
+
 ## SMP and eMMC findings (2026-10-19, photos IMG_1912-1920)
 - **4 A73 cores up** (`cpus=4`, photo IMG_1920).
   - Huawei PSCI returns -9 INVALID_ADDRESS for every CPU_ON entry point except the one used by the **first CPU_ON after boot** (the shim's A53 -> 0x100 call at `secondary_entry`, 0x80848). Tested: 0x80400, 0x80878, 0x98000 and RAM up to 0x200000000 all rejected.
