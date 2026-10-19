@@ -64,6 +64,12 @@ All gates passed:
   - clkdiv_spi = hiword 0xC4 mask 0xF000
   - clkmux_spi = hiword 0xAC bit 8
 - **Protocol:** Linux driver `kernel-marie/drivers/devkit/tpkit/panel/novatek/nt36xxx*.c`.
+- **Shim probe** (`shim/touch.c`, photos 2026-10-19 21:2x):
+  - SPI1 is clocked by enabling PEREN2 bit 9, not in reset; fastboot already muxes GPIO 7/8/9 to SPI and has CS as an output.
+  - The touch reset GPIO is driven LOW by fastboot; release it (high).
+  - After a bootloader reset (0x69 -> 0x03F0FE), page 0x1F600 offset 0x4E returns **`0A 00 00 82 66 03`**: Huawei's trim table entry for the **NT36672A memory map**.
+  - It works in **SPI mode 0** (also 2/3) at SSPCLK/160. Mode 1, as in the DT, returns zeros or noise at both speeds.
+  - Next: firmware download (TDDI without flash, `use_dma_download_firmware`), firmware for project id `MARI71130` from the vendor image.
 - **Note:** the ../marie busybox image has only ash/ls/cat/echo/dmesg… (no grep/dd/base64), so `tools/marie-log-pull.py` needs a richer image.
 
 ## Phase 3 milestone: iOS home screen on the phone (2026-10-19)

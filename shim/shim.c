@@ -14,6 +14,7 @@
 #include "console.h"
 #include "loader.h"
 #include "emmc.h"
+#include "touch.h"
 
 #define SP805_BASE		0xe8a06000UL	/* kirin710_cs_config.dtsi watchdog0 */
 #define SP805_CONTROL		0x008
@@ -76,9 +77,9 @@ extern char xnu_psci_tramp[], xnu_psci_mailbox[];
  * end in a synchronous external abort. probe32() turns that into ok = 0:
  * exc_handler() skips the faulting load while probe_on is set.
  */
-static volatile int probe_on, probe_fault;
+volatile int probe_on, probe_fault;
 
-static uint32_t probe32(uintptr_t a, int *ok)
+uint32_t probe32(uintptr_t a, int *ok)
 {
 	uint32_t v = 0xdeadbeef;
 
@@ -398,7 +399,7 @@ static void cpu_report(const char *label)
  * The boot CPU is A53 CPU 0 (no 16K granule if Cortex-A53 behaves as on
  * topaz). The A73 at MPIDR 0x100 is where xnu will have to run.
  */
-static void test_sibling_cpu_on(void);
+static void __attribute__((unused)) test_sibling_cpu_on(void);
 
 static void __attribute__((noreturn)) gold_main(void)
 {
@@ -418,11 +419,8 @@ static void __attribute__((noreturn)) gold_main(void)
 	}
 	/* Milestone 2: sibling CPU_ON and eMMC probes instead of the GIC/watchdog checks */
 	con_skip();
-	stage = "cpu_on sib";
-	test_sibling_cpu_on();
-	con_skip();
-	stage = "emmc";
-	test_emmc();
+	stage = "touch";
+	test_touch();
 	halt();
 
 	/* Watchdog check: nothing pets anything from here on. */
@@ -464,7 +462,7 @@ static const uint64_t onaddr[] = {
 	0xff00000, 0x2e300000, 0x40000000, 0x80000000, 0xc0000000, 0x200000000,
 };
 
-static void test_sibling_cpu_on(void)
+static void __attribute__((unused)) test_sibling_cpu_on(void)
 {
 	/* mailbox stays 0: secondary_entry is xnu's trampoline once it is set */
 	for (unsigned i = 0; i < sizeof(onaddr) / sizeof(onaddr[0]); i++) {
