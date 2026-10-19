@@ -46,6 +46,26 @@ All gates passed:
 - **GIC-400:** GICD_TYPER `0xFCEB` (384 IRQs, 8 CPU interfaces, SecurityExtn). The CPU interface on A73 0x100 is **#4**. GICD/GICC are already enabled for Group 1 with PMR `0xF0`. vtimer PPI 27, ptimer PPI 30 and SGI 1 are delivered as NS Group 1 IRQs (30/30/10 in 300 ms).
 - **Watchdog:** after disabling the SP805, 300 s idle with no reset.
 
+## Touch hardware (live DT via ../marie busybox USB serial, 2026-10-19; tools/marie-serial.py --props)
+- **Controller:** Novatek NT36682A TDDI (`/ts_kit/novatek@62`, ic_type 2, x/y max 1080x2312); vci/vddio type 0, powered with the panel.
+- **Bus:** `/ts_kit`: `bus_type spi`, `bus_id 1` = **PL022 `spi@fdf08000`** (4 CS, DMA, source 41 MHz), 10 MHz, `spi-mode 1`.
+  - pl022 com-mode 1, ctrl-len 7, rx/tx-level-trig 3
+  - cs_reset_low_delay 10, high_delay 200
+- **GPIOs** (all PL061):
+  - **CS** = `gpio@e8a0c000` pin 2 (GPIO-driven chip select)
+  - **IRQ** = `gpio@fff0f000` pin 2 (GIC SPI 110 for the bank; pin = GPIO 210)
+  - **reset** = `gpio@e8a10000` pin 0
+- **Pin mux** (pinctrl-single, 32-bit, function mask 7):
+  - SPI1 = GPIO 7/8/9 function 1: IOMG `0xE896C708/70C/710`, IOCG `pinmux@e896c800` +0x708.. = 0
+  - touch IRQ GPIO 210 function 0: IOMG `0xFFF11708`, IOCG `pinmux@fff11800` +0x708 = 0
+- **SPI1 clocks** (PERI_CRG `0xFFF35000`):
+  - clk_spi1/pclk_spi1 gate = PEREN2 (0x20, dis 0x24, stat 0x28) bit 9
+  - clkgt_spi = hiword 0xF4 bit 13 (always on)
+  - clkdiv_spi = hiword 0xC4 mask 0xF000
+  - clkmux_spi = hiword 0xAC bit 8
+- **Protocol:** Linux driver `kernel-marie/drivers/devkit/tpkit/panel/novatek/nt36xxx*.c`.
+- **Note:** the ../marie busybox image has only ash/ls/cat/echo/dmesg… (no grep/dd/base64), so `tools/marie-log-pull.py` needs a richer image.
+
 ## Phase 3 milestone: iOS home screen on the phone (2026-10-19)
 - **Kernel:** xnu 0207 (CI 39305111981, `xnu/out-0207`), image `shim/out/marie-0207-gui.img`. Built with `CPUS=4 MARIE_DISPLAY=1 tools/marie-image.sh ... --args "rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 sweetfb_hz=30 sweetfb_noconsole=1"`.
 - **Display:** AppleCLCD copy path (xnu 0206) into the fastboot logo buffer; iPhone X canvas 1125x2436 cropped to the 1080x2312 panel.
