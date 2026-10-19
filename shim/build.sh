@@ -8,16 +8,20 @@ cd "$(dirname "$0")"
 CC="clang --target=aarch64-none-elf"
 OBJCOPY=llvm-objcopy
 CFLAGS="-O2 -mcpu=cortex-a53 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-jump-tables -Wall -Wextra"
-OBJS="start shim console loader fdt emmc touch"
+OBJS="start shim console loader fdt emmc touch fwblob"
+# Huawei's touch firmware (not in git, see PLAN.md); without it the touch test only probes
+NVT_FW=../research/touch/marie_novatek_MARI71130_130.bin
+FWFLAG=
+[ -f "$NVT_FW" ] && FWFLAG="-DNVT_FW_PATH=\"$(realpath "$NVT_FW")\""
 mkdir -p out
 for f in $OBJS; do
 	src=$f.c
 	[ -f $src ] || src=$f.S
-	$CC $CFLAGS -c $src -o out/$f.o
+	$CC $CFLAGS $FWFLAG -c $src -o out/$f.o
 done
 # The image runs wherever fastboot puts it with no relocation pass: only the
 # header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$(for f in $OBJS; do [ $f = start ] || llvm-readelf -r out/$f.o; done | grep -c ABS64 || true)
+abs=$(for f in $OBJS; do [ $f = start ] || [ $f = fwblob ] || llvm-readelf -r out/$f.o; done | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 $CC $CFLAGS -static -fuse-ld=lld -T shim.ld -Wl,--build-id=none -Wl,-N \
 	$(for f in $OBJS; do echo out/$f.o; done) -o out/shim.elf
