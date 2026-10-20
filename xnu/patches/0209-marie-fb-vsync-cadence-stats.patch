@@ -1,0 +1,228 @@
+marie: fixed-cadence vsync and on-screen frame statistics
+
+The vsync timer re-armed itself 16.7 ms after present() finished, so the
+vsync notifications backboardd paces on slowed down by however long the
+CPU copy into the panel took. Re-arm at absolute deadlines (skipping
+missed ones) instead.
+
+Once a second the framebuffer records vsyncs (v), frames shown (f),
+swaps from backboardd (s), average/longest present() in ms (p) and the
+busy percentage of each CPU (c), logs it (first minutes) and, with
+boot-arg sweetfb_stats=1, draws it in the top-left corner of the panel.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9f53f6e..6aef5a1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -87,6 +87,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <mach/processor_info.h>
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -122,6 +123,8 @@ enum {
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++static uint64_t sweet_fb_swap_total(void);
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -204,6 +207,17 @@ public:
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	/* fixed-cadence vsync: absolute deadlines, so present() time does not stretch the period */
++	uint64_t      fNextVsync;
++	void          rearm(IOTimerEventSource *t);
++	/* boot-arg sweetfb_stats=1: per-second frame statistics drawn on the panel */
++	bool          fStats;
++	uint64_t      fStatT0, fStatSwaps0, fStatPresAbs, fStatPresMax;
++	uint32_t      fStatVsyncs, fStatPresents;
++	uint32_t      fStatTicks[8][2];        /* per CPU: busy, total (hz ticks) */
++	char          fStatText[96];
++	void          statsTick(uint64_t now);
++	void          statsDraw(void);
+ };
+ 
+ /*
+@@ -390,7 +404,12 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	int stats = 0;
++	PE_parse_boot_argn("sweetfb_stats", &stats, sizeof(stats));
++	fStats = stats != 0;
++	fNextVsync = mach_absolute_time();
++	fStatT0 = fNextVsync;
++	rearm(fVsync);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -433,7 +452,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (fb->fDsi != NULL) {
+ 			/* the panel is dark (DCS 0x51 0); keep the last frame */
+ 			IOLockUnlock(fb->fLock);
+-			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			fb->rearm(sender);
+ 			return;
+ 		}
+ 		if (fb->fFadeOrig != NULL) {
+@@ -451,7 +470,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+ 				fb->fadeStep(src, srcStride, step);
+ 			}
+-			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			fb->rearm(sender);
+ 			return;
+ 		}
+ 		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
+@@ -471,7 +490,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->rearm(sender);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -496,14 +515,121 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		uint64_t dt = mach_absolute_time() - t0;
++		fb->fStatPresents++;
++		fb->fStatPresAbs += dt;
++		if (dt > fb->fStatPresMax) {
++			fb->fStatPresMax = dt;
++		}
++		if (fb->fStats) {
++			fb->statsDraw();        /* present() just overwrote it */
++		}
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		IOLockLock(fb->fLock);
+ 		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+ 		memcpy(fb->fShowHold, taken, sizeof(taken));
+ 		IOLockUnlock(fb->fLock);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fb->fStatVsyncs++;
++	fb->statsTick(mach_absolute_time());
++	fb->rearm(sender);
++}
++
++void
++AppleCLCD::rearm(IOTimerEventSource *t)
++{
++	uint64_t period, now = mach_absolute_time();
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &period);
++	fNextVsync += period;
++	if (fNextVsync <= now) {
++		/* late (present took longer than a period): skip the missed vsyncs */
++		fNextVsync += ((now - fNextVsync) / period + 1) * period;
++	}
++	t->wakeAtTime((AbsoluteTime)fNextVsync);
++}
++
++extern "C" processor_t processor_array[];
++extern "C" kern_return_t processor_info(processor_t processor, processor_flavor_t flavor,
++    host_t *host, processor_info_t info, mach_msg_type_number_t *count);
++extern "C" unsigned char iso_font[256 * 16];
++
++/*
++ * Once a second: vsyncs, frames shown (presents), swaps from backboardd,
++ * average / longest present() and the load of each CPU. Always logged;
++ * drawn on the panel with sweetfb_stats=1.
++ */
++void
++AppleCLCD::statsTick(uint64_t now)
++{
++	uint64_t sec;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
++	if (now - fStatT0 < sec) {
++		return;
++	}
++	uint64_t swaps = sweet_fb_swap_total();
++	uint64_t avg_us = 0, max_us = 0;
++	if (fStatPresents != 0) {
++		absolutetime_to_nanoseconds(fStatPresAbs / fStatPresents, &avg_us);
++		avg_us /= 1000;
++	}
++	absolutetime_to_nanoseconds(fStatPresMax, &max_us);
++	max_us /= 1000;
++	int n = snprintf(fStatText, sizeof(fStatText), "v%u f%u s%llu p%llu/%llums c",
++	    fStatVsyncs, fStatPresents, swaps - fStatSwaps0, avg_us / 1000, max_us / 1000);
++	for (int i = 0; i < 8 && n > 0 && n < (int)sizeof(fStatText) - 4; i++) {
++		processor_t pr = processor_array[i];
++		if (pr == NULL) {
++			continue;
++		}
++		processor_cpu_load_info_data_t li;
++		mach_msg_type_number_t cnt = PROCESSOR_CPU_LOAD_INFO_COUNT;
++		host_t host;
++		if (processor_info(pr, PROCESSOR_CPU_LOAD_INFO, &host, (processor_info_t)&li, &cnt) != KERN_SUCCESS) {
++			continue;
++		}
++		uint32_t busy = li.cpu_ticks[CPU_STATE_USER] + li.cpu_ticks[CPU_STATE_SYSTEM];
++		uint32_t total = busy + li.cpu_ticks[CPU_STATE_IDLE];
++		uint32_t db = busy - fStatTicks[i][0], dt = total - fStatTicks[i][1];
++		fStatTicks[i][0] = busy;
++		fStatTicks[i][1] = total;
++		uint32_t pct = dt ? (db * 99 + dt / 2) / dt : 0;
++		n += snprintf(fStatText + n, sizeof(fStatText) - n, " %02u", pct);
++	}
++	static uint32_t logged;
++	if (logged < 600 && (logged++ % 10) == 0) {
++		IOLog("SWEET FB stats: %s\n", fStatText);
++	}
++	fStatT0 = now;
++	fStatSwaps0 = swaps;
++	fStatVsyncs = fStatPresents = 0;
++	fStatPresAbs = fStatPresMax = 0;
++	if (fStats) {
++		statsDraw();
++	}
++}
++
++/* fStatText in iso_font at 2x, white on black, below the status bar. */
++void
++AppleCLCD::statsDraw(void)
++{
++	const uint32_t sc = 2, x0 = 24, y0 = 150;
++	uint8_t *dst = fFlip[0] != NULL ? (uint8_t *)fFlip[fFlipIdx]->getBytesNoCopy() : (uint8_t *)fPixels;
++	size_t len = strnlen(fStatText, sizeof(fStatText));
++	if (x0 + (len + 1) * 8 * sc > fWidth) {
++		len = fWidth / (8 * sc) - 1 - x0 / (8 * sc);
++	}
++	for (uint32_t y = 0; y < 16 * sc; y++) {
++		uint32_t *row = (uint32_t *)(dst + (uint64_t)(y0 + y) * fRowBytes) + x0;
++		const unsigned char *glyphs = iso_font + (y / sc);
++		for (size_t c = 0; c < len; c++) {
++			unsigned char bits = glyphs[(unsigned char)fStatText[c] * 16];
++			for (uint32_t x = 0; x < 8 * sc; x++) {
++				*row++ = (bits & (1u << (x / sc))) ? 0xffffffff : 0xff000000;
++			}
++		}
++	}
+ }
+ 
+ void
+@@ -536,6 +662,12 @@ get32(const uint8_t *p, uint32_t off)
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++static uint64_t
++sweet_fb_swap_total(void)
++{
++	return sweet_fb_swap_count;
++}
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
