@@ -1,0 +1,168 @@
+marie: framebuffer statistics show the busiest processes
+
+0209 showed all four A73s ~35 % busy on a static home screen and ~80 %
+while scrolling at 12 fps. A second statistics line lists the four
+processes that used the most CPU in the last second (percent of one
+CPU, from fill_taskprocinfo deltas; bsd/dev/sweet_sample.c sweet_top).
+CPU busy percentages are clamped (busy and idle ticks are not read
+atomically).
+
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..b8f3dfd 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -86,3 +86,78 @@ sweet_sample_start(void)
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * marie: the busiest processes since the previous call, for the framebuffer
++ * statistics line (SweetFramebuffer.cpp, boot-arg sweetfb_stats). Writes
++ * " name pct" for the top four, pct of one CPU over `window` (mach time).
++ * Only the framebuffer's work loop calls it.
++ */
++#include <sys/bsdtask_info.h>
++
++#define SWEET_TOP_MAX   1024
++#define SWEET_TOP_N     4
++struct sweet_top_ent {
++	int      pid;
++	uint64_t t;
++};
++static struct sweet_top_ent sweet_top_tab[2][SWEET_TOP_MAX];
++static int sweet_top_n[2], sweet_top_cur;
++static struct {
++	uint64_t d;
++	char     name[12];
++} sweet_top_best[SWEET_TOP_N];
++
++static int
++sweet_top_proc(proc_t p, __unused void *arg)
++{
++	struct sweet_top_ent *prev = sweet_top_tab[sweet_top_cur ^ 1];
++	struct sweet_top_ent *cur = sweet_top_tab[sweet_top_cur];
++	int nprev = sweet_top_n[sweet_top_cur ^ 1];
++	task_t task = proc_task(p);
++	if (task == TASK_NULL || sweet_top_n[sweet_top_cur] >= SWEET_TOP_MAX) {
++		return PROC_RETURNED;
++	}
++	struct proc_taskinfo_internal ti;
++	bzero(&ti, sizeof(ti));
++	fill_taskprocinfo(task, &ti);
++	uint64_t t = ti.pti_total_user + ti.pti_total_system, d = nprev ? t : 0;
++	int pid = proc_pid(p);
++	for (int i = 0; i < nprev; i++) {
++		if (prev[i].pid == pid) {
++			d = t >= prev[i].t ? t - prev[i].t : 0;
++			break;
++		}
++	}
++	cur[sweet_top_n[sweet_top_cur]++] = (struct sweet_top_ent){ pid, t };
++	for (int i = 0; i < SWEET_TOP_N; i++) {
++		if (d > sweet_top_best[i].d) {
++			memmove(&sweet_top_best[i + 1], &sweet_top_best[i], (SWEET_TOP_N - 1 - i) * sizeof(sweet_top_best[0]));
++			sweet_top_best[i].d = d;
++			strlcpy(sweet_top_best[i].name, proc_best_name(p), sizeof(sweet_top_best[i].name));
++			break;
++		}
++	}
++	return PROC_RETURNED;
++}
++
++void sweet_top(char *buf, size_t len, uint64_t window);
++
++void
++sweet_top(char *buf, size_t len, uint64_t window)
++{
++	sweet_top_n[sweet_top_cur] = 0;
++	bzero(sweet_top_best, sizeof(sweet_top_best));
++	proc_iterate(PROC_ALLPROCLIST, sweet_top_proc, NULL, NULL, NULL);
++	sweet_top_cur ^= 1;
++	size_t n = 0;
++	buf[0] = '\0';
++	for (int i = 0; i < SWEET_TOP_N && sweet_top_best[i].d != 0 && n < len; i++) {
++		int r = snprintf(buf + n, len - n, " %s %llu", sweet_top_best[i].name,
++		    window ? sweet_top_best[i].d * 100 / window : 0);
++		if (r < 0) {
++			break;
++		}
++		n += (size_t)r;
++	}
++}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6aef5a1..f0c8f45 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -216,8 +216,10 @@ public:
+ 	uint32_t      fStatVsyncs, fStatPresents;
+ 	uint32_t      fStatTicks[8][2];        /* per CPU: busy, total (hz ticks) */
+ 	char          fStatText[96];
++	char          fStatTop[96];           /* busiest processes */
+ 	void          statsTick(uint64_t now);
+ 	void          statsDraw(void);
++	void          statsLine(const char *text, uint32_t y0);
+ };
+ 
+ /*
+@@ -554,6 +556,7 @@ extern "C" processor_t processor_array[];
+ extern "C" kern_return_t processor_info(processor_t processor, processor_flavor_t flavor,
+     host_t *host, processor_info_t info, mach_msg_type_number_t *count);
+ extern "C" unsigned char iso_font[256 * 16];
++extern "C" void sweet_top(char *buf, size_t len, uint64_t window);  /* bsd/dev/sweet_sample.c */
+ 
+ /*
+  * Once a second: vsyncs, frames shown (presents), swaps from backboardd,
+@@ -592,14 +595,18 @@ AppleCLCD::statsTick(uint64_t now)
+ 		uint32_t busy = li.cpu_ticks[CPU_STATE_USER] + li.cpu_ticks[CPU_STATE_SYSTEM];
+ 		uint32_t total = busy + li.cpu_ticks[CPU_STATE_IDLE];
+ 		uint32_t db = busy - fStatTicks[i][0], dt = total - fStatTicks[i][1];
++		if (db > dt) {
++			db = dt;        /* busy and idle are not sampled atomically */
++		}
+ 		fStatTicks[i][0] = busy;
+ 		fStatTicks[i][1] = total;
+ 		uint32_t pct = dt ? (db * 99 + dt / 2) / dt : 0;
+ 		n += snprintf(fStatText + n, sizeof(fStatText) - n, " %02u", pct);
+ 	}
++	sweet_top(fStatTop, sizeof(fStatTop), now - fStatT0);
+ 	static uint32_t logged;
+ 	if (logged < 600 && (logged++ % 10) == 0) {
+-		IOLog("SWEET FB stats: %s\n", fStatText);
++		IOLog("SWEET FB stats: %s |%s\n", fStatText, fStatTop);
+ 	}
+ 	fStatT0 = now;
+ 	fStatSwaps0 = swaps;
+@@ -610,13 +617,20 @@ AppleCLCD::statsTick(uint64_t now)
+ 	}
+ }
+ 
+-/* fStatText in iso_font at 2x, white on black, below the status bar. */
++/* fStatText and fStatTop in iso_font at 2x, white on black, below the status bar. */
+ void
+ AppleCLCD::statsDraw(void)
+ {
+-	const uint32_t sc = 2, x0 = 24, y0 = 150;
++	statsLine(fStatText, 150);
++	statsLine(fStatTop, 150 + 32);
++}
++
++void
++AppleCLCD::statsLine(const char *text, uint32_t y0)
++{
++	const uint32_t sc = 2, x0 = 24;
+ 	uint8_t *dst = fFlip[0] != NULL ? (uint8_t *)fFlip[fFlipIdx]->getBytesNoCopy() : (uint8_t *)fPixels;
+-	size_t len = strnlen(fStatText, sizeof(fStatText));
++	size_t len = strnlen(text, 96);
+ 	if (x0 + (len + 1) * 8 * sc > fWidth) {
+ 		len = fWidth / (8 * sc) - 1 - x0 / (8 * sc);
+ 	}
+@@ -624,7 +638,7 @@ AppleCLCD::statsDraw(void)
+ 		uint32_t *row = (uint32_t *)(dst + (uint64_t)(y0 + y) * fRowBytes) + x0;
+ 		const unsigned char *glyphs = iso_font + (y / sc);
+ 		for (size_t c = 0; c < len; c++) {
+-			unsigned char bits = glyphs[(unsigned char)fStatText[c] * 16];
++			unsigned char bits = glyphs[(unsigned char)text[c] * 16];
+ 			for (uint32_t x = 0; x < 8 * sc; x++) {
+ 				*row++ = (bits & (1u << (x / sc))) ? 0xffffffff : 0xff000000;
+ 			}
