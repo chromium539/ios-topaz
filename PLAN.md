@@ -46,6 +46,17 @@ All gates passed:
 - **GIC-400:** GICD_TYPER `0xFCEB` (384 IRQs, 8 CPU interfaces, SecurityExtn). The CPU interface on A73 0x100 is **#4**. GICD/GICC are already enabled for Group 1 with PMR `0xF0`. vtimer PPI 27, ptimer PPI 30 and SGI 1 are delivered as NS Group 1 IRQs (30/30/10 in 300 ms).
 - **Watchdog:** after disabling the SP805, 300 s idle with no reset.
 
+## Phase 5: speed (2026-10-20, in progress)
+- **Boot time:** 1 min 40 s from power-on to the home screen (boot `marie-0208-dvfs.img`, with cpus=4). The ~10 min boot on 2026-10-19 was the first boot after flashing the root image.
+- **CPU clocks:** PMCTRL hw vote (`0xFFF31000`, from `kirin710_hw_vote.dtsi` / `drivers/hisi/hw_vote`):
+  - big vote: `+0x270[7:0]` = MHz/16, write enables in bits 16–23
+  - result: `+0x2dc` (`[7:0]` big, `[15:8]` little, `[23:16]` GPU, ×16 MHz)
+  - fastboot already leaves `res=00196A72`: A73 at 1824 MHz, A53 at 1696 MHz, GPU at 400 MHz
+  - the shim's vote of 1824 MHz is therefore a no-op, kept to pin the clock
+  - the shim's A73 loop estimate (~151 "MHz") is an artefact of running with the MMU off on the A73, not the real clock. The A53 estimate (768) is consistent with ~2 cycles/iteration.
+- **60 fps** (`sweetfb_hz=60`): somewhat smoother but still visibly below 30 fps. `marietouchdiv=32` (SPI ~16× faster) works.
+- **0209:** vsync at fixed absolute deadlines (it used to re-arm 16.7 ms *after* present()), plus statistics drawn on screen with `sweetfb_stats=1`, in the order `v<vsyncs> f<frames shown> s<swaps> p<avg>/<max>ms c <busy % per CPU>`.
+
 ## Phase 4 milestone: touch, home screen reachable (2026-10-19)
 - **Image:** xnu 0208 (CI 39313916759, `xnu/out-0208`), `shim/out/marie-0208-touch.img`. Built with `CPUS=4 MARIE_DISPLAY=1 tools/marie-image.sh ... --args "rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1 sweetfb_hz=30 sweetfb_noconsole=1"`.
 - **Shim:** downloads Huawei's Novatek firmware before xnu (`touch_prepare`). The firmware is decoded from the vendor EROFS into `research/touch/`, not in git. The vendor image is an early Huawei EROFS that neither erofs-utils 1.9 nor Linux 6.18 can read, hence the block-by-block LZ4 decode.
