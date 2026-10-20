@@ -1,0 +1,97 @@
+marie: boot-arg sweetnoexec refuses to start named programs
+
+The 0211 statistics on a still home screen: vmd (visual voicemail,
+com.apple.voicemail.vmd) 86 % of a CPU and launchd 32 %, with no
+telephony for vmd to talk to. sweetnoexec=NAME,... fails the exec of
+those process names the way a wrong-platform binary fails ("noexec
+NAME" on the console); launchd throttles the respawns. The statistics
+lines are now drawn across the full width so a shorter line leaves
+nothing behind.
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..a187c88 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7325,6 +7325,45 @@ proc_process_signature(proc_t p, os_reason_t *signature_failure_reason)
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * marie: boot-arg sweetnoexec=NAME,NAME... refuses to start those programs
++ * (exact process name, as in the "exec NAME" lines). For daemons that only
++ * spin without the hardware they serve, e.g. vmd (visual voicemail) burns
++ * most of a CPU without telephony. launchd throttles the respawns.
++ */
++static bool
++sweet_exec_denied(const char *name)
++{
++	static char list[256];
++	static int parsed;
++	static int logged;
++	if (!parsed) {
++		if (!PE_parse_boot_argn("sweetnoexec", list, sizeof(list))) {
++			list[0] = '\0';
++		}
++		parsed = 1;
++	}
++	size_t n = strlen(name);
++	for (const char *c = list; *c != '\0';) {
++		const char *e = strchr(c, ',');
++		size_t l = e ? (size_t)(e - c) : strlen(c);
++		if (l == n && n != 0 && strncmp(c, name, n) == 0) {
++			if (logged < 50) {
++				logged++;
++				printf("noexec %s\n", name);
++			}
++			return true;
++		}
++		if (e == NULL) {
++			break;
++		}
++		c = e + 1;
++	}
++	return false;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static int
+ process_signature(proc_t p, struct image_params *imgp)
+ {
+@@ -7412,6 +7451,12 @@ process_signature(proc_t p, struct image_params *imgp)
+ 				goto done;
+ 			}
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++			if (sweet_exec_denied(p->p_name)) {
++				signature_failure_reason = os_reason_create(OS_REASON_EXEC,
++				    EXEC_EXIT_REASON_WRONG_PLATFORM);
++				error = EACCES;
++				goto done;
++			}
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
+ #else
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6068320..fde8af9 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -636,15 +636,14 @@ AppleCLCD::statsLine(const char *text, uint32_t y0)
+ {
+ 	const uint32_t sc = 2, x0 = 24;
+ 	uint8_t *dst = fFlip[0] != NULL ? (uint8_t *)fFlip[fFlipIdx]->getBytesNoCopy() : (uint8_t *)fPixels;
+-	size_t len = strnlen(text, 96);
+-	if (x0 + (len + 1) * 8 * sc > fWidth) {
+-		len = fWidth / (8 * sc) - 1 - x0 / (8 * sc);
+-	}
++	/* the whole line width: blank after the text, so a shorter line leaves nothing behind */
++	size_t tlen = strnlen(text, 96);
++	size_t len = (fWidth - 2 * x0) / (8 * sc);
+ 	for (uint32_t y = 0; y < 16 * sc; y++) {
+ 		uint32_t *row = (uint32_t *)(dst + (uint64_t)(y0 + y) * fRowBytes) + x0;
+ 		const unsigned char *glyphs = iso_font + (y / sc);
+ 		for (size_t c = 0; c < len; c++) {
+-			unsigned char bits = glyphs[(unsigned char)text[c] * 16];
++			unsigned char bits = c < tlen ? glyphs[(unsigned char)text[c] * 16] : 0;
+ 			for (uint32_t x = 0; x < 8 * sc; x++) {
+ 				*row++ = (bits & (1u << (x / sc))) ? 0xffffffff : 0xff000000;
+ 			}
