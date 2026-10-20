@@ -1,0 +1,63 @@
+marie: framebuffer statistics count emulated LSE/LDAPR instructions
+
+The iPhone X userland's LSE atomics and LDAPR trap into
+sweet_emulate_lse on the A73 (ARMv8.0). Count them (sweet_lse_emulated)
+and show the rate per second at the start of the second statistics line
+("e<count>"). On the same phone under Linux (../marie-ios) they ran at up
+to ~650k/s while settling and ~120k/s while swiping.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f0c8f45..6068320 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -217,6 +217,7 @@ public:
+ 	uint32_t      fStatTicks[8][2];        /* per CPU: busy, total (hz ticks) */
+ 	char          fStatText[96];
+ 	char          fStatTop[96];           /* busiest processes */
++	uint64_t      fStatLse0;
+ 	void          statsTick(uint64_t now);
+ 	void          statsDraw(void);
+ 	void          statsLine(const char *text, uint32_t y0);
+@@ -557,6 +558,7 @@ extern "C" kern_return_t processor_info(processor_t processor, processor_flavor_
+     host_t *host, processor_info_t info, mach_msg_type_number_t *count);
+ extern "C" unsigned char iso_font[256 * 16];
+ extern "C" void sweet_top(char *buf, size_t len, uint64_t window);  /* bsd/dev/sweet_sample.c */
++extern "C" uint64_t sweet_lse_emulated;     /* osfmk/arm64/sleh.c */
+ 
+ /*
+  * Once a second: vsyncs, frames shown (presents), swaps from backboardd,
+@@ -603,7 +605,11 @@ AppleCLCD::statsTick(uint64_t now)
+ 		uint32_t pct = dt ? (db * 99 + dt / 2) / dt : 0;
+ 		n += snprintf(fStatText + n, sizeof(fStatText) - n, " %02u", pct);
+ 	}
+-	sweet_top(fStatTop, sizeof(fStatTop), now - fStatT0);
++	/* second line: emulated LSE/LDAPR instructions per second, then the busiest processes */
++	uint64_t lse = sweet_lse_emulated;
++	int m = snprintf(fStatTop, sizeof(fStatTop), "e%llu", lse - fStatLse0);
++	fStatLse0 = lse;
++	sweet_top(fStatTop + m, sizeof(fStatTop) - m, now - fStatT0);
+ 	static uint32_t logged;
+ 	if (logged < 600 && (logged++ % 10) == 0) {
+ 		IOLog("SWEET FB stats: %s |%s\n", fStatText, fStatTop);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 47c175b..ce16f55 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -888,6 +888,9 @@ extern int _sweet_lse_x(user_addr_t, uint32_t, uint64_t, uint64_t, uint64_t *);
+  * (machine_routines_asm.s); returns false for anything else (CASP stays
+  * EXC_BAD_INSTRUCTION).
+  */
++/* emulated instructions since boot (marie: framebuffer statistics) */
++uint64_t sweet_lse_emulated;
++
+ static bool
+ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ {
+@@ -943,6 +946,7 @@ sweet_emulate_lse(arm_saved_state_t *state, uint32_t instr)
+ 		set_saved_state_reg(state, dst, (register_t)old);
+ 	}
+ 	add_saved_state_pc(state, 4);
++	os_atomic_inc(&sweet_lse_emulated, relaxed);
+ 	return true;
+ }
+ #endif /* SWEET */
