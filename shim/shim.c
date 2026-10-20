@@ -226,6 +226,43 @@ static uint32_t cpu_mhz(void)
 	return us ? (uint32_t)(20000000 / us) : 0;
 }
 
+/* Decimal digits packed as hex nibbles, so con_hex prints n in decimal. */
+static uint32_t bcd(uint32_t n)
+{
+	uint32_t r = 0;
+	for (int sh = 0; n && sh < 32; sh += 4, n /= 10)
+		r |= (n % 10) << sh;
+	return r;
+}
+
+/*
+ * Big-cluster DVFS. Fastboot leaves the A73s far below their lowest OPP;
+ * Linux (drivers/hisi/hw_vote, kirin710_hw_vote.dtsi big-freq vote-src-1)
+ * asks LPM3 for a frequency by writing MHz/16 into PMCTRL 0x270[7:0]
+ * (bits 16-23 are the write enables); LPM3 reports the result in
+ * 0x2dc[7:0]. The vote stays in place for xnu.
+ */
+#define PMCTRL		0xfff31000UL
+#define HV_BIG_VOTE	0x270
+#define HV_RESULT	0x2dc
+#define BIG_MHZ		1824		/* OPP 5 of 7, 1.0 V; max is 2189 */
+
+static void big_freq_vote(void)
+{
+	int ok1, ok2;
+	uint32_t v = probe32(PMCTRL + HV_BIG_VOTE, &ok1);
+	uint32_t r = probe32(PMCTRL + HV_RESULT, &ok2);
+	con_hex2("HVOTE", "big=", v, "res=", r);
+	if (!ok1 || !ok2)
+		return;
+	wr32(PMCTRL + HV_BIG_VOTE, 0x00ff0000 | (BIG_MHZ / 16));
+	uint64_t t0 = now();
+	while (((rd32(PMCTRL + HV_RESULT) & 0xff) != BIG_MHZ / 16) &&
+	       now() - t0 < rsr("cntfrq_el0") / 10)
+		;
+	con_hex2("HVOTE", "big=", rd32(PMCTRL + HV_BIG_VOTE), "res=", rd32(PMCTRL + HV_RESULT));
+}
+
 /* ---- watchdog ---- */
 
 static void sp805_disable(void)
@@ -433,7 +470,12 @@ static void __attribute__((noreturn)) gold_main(void)
 		;
 	con_skip();
 	cpu_report("A73");
-	con_hex2(" mhz", "a73~", cpu_mhz(), "a53~", a53_mhz);
+	con_hex2(" mhz", "a73~", bcd(cpu_mhz()), "a53~", bcd(a53_mhz));
+	big_freq_vote();
+	con_hex2(" mhz", "a73~", bcd(cpu_mhz()), "a53~", bcd(a53_mhz));
+	/* hold the screen so the clock lines can be photographed */
+	for (uint64_t t0 = now(); now() - t0 < 5 * rsr("cntfrq_el0");)
+		;
 	if (payload_present()) {
 		con_skip();
 		/* loader.c writes these into the ADT for xnu's secondary CPUs */
